@@ -73,7 +73,17 @@ class CollectorEngine:
             site_new = 0
             site_total = 0
             try:
-                discovery = adapter.discover(self.fetcher)
+                if adapter.code == "AMB":
+                    adapter.cancel_check = (
+                        (lambda page: progress(adapter.code, f"{adapter.label} 목록 {page + 1}페이지", index, len(enabled)))
+                        if progress else None
+                    )
+                    try:
+                        discovery = adapter.discover(self.fetcher)
+                    finally:
+                        adapter.cancel_check = None
+                else:
+                    discovery = adapter.discover(self.fetcher)
                 urls = list(discovery.urls)
                 hints = dict(getattr(discovery, "hints", {}) or {})
                 inventory_items = dict(getattr(discovery, "inventory_items", {}) or {})
@@ -230,6 +240,8 @@ class CollectorEngine:
                 logger.warning("site %s login required: %s", adapter.code, e)
                 self.db.set_site_status(adapter.code, "login_required", error=str(e), new_count=site_new, total_count=site_total)
             except Exception as e:
+                if getattr(e, "user_cancelled", False):
+                    raise
                 logger.exception("site %s failed", adapter.code)
                 result.errors += 1
                 result.messages.append(f"{adapter.code}: {e}")

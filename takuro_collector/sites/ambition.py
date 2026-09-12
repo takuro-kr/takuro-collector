@@ -168,9 +168,14 @@ class AmbitionAdapter(BaseAdapter):
         any_browser = False
         for seed in self.seed_urls:
             page_url = seed
+            page_number = 0
             seed_path = unquote(urlparse(seed).path).rstrip("/")
             while page_url and page_url not in seen_pages:
+                cancel_check = getattr(self, "cancel_check", None)
+                if cancel_check:
+                    cancel_check(page_number)
                 seen_pages.add(page_url)
+                page_number += 1
                 result = fetcher.fetch(page_url, self.code, force_browser=self.force_browser,
                                        login_expected=self.login_expected)
                 any_browser = any_browser or result.via_browser

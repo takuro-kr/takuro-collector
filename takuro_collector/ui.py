@@ -10,8 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QTextCursor
+from PySide6.QtCore import QRect, QSettings, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices, QGuiApplication, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -108,13 +109,58 @@ def _package_state_label(prop: dict) -> str:
     return _wp_state_label(str(prop.get("wp_sync_state") or "pending"))
 
 class TaskCancelled(RuntimeError):
-    pass
+    user_cancelled = True
+
+
+def _fit_rect_to_available(rect: QRect, available: QRect) -> QRect:
+    width = min(max(1, rect.width()), max(1, available.width()))
+    height = min(max(1, rect.height()), max(1, available.height()))
+    x = min(max(rect.x(), available.x()), available.x() + available.width() - width)
+    y = min(max(rect.y(), available.y()), available.y() + available.height() - height)
+    return QRect(x, y, width, height)
+
+
+def _preferred_screen(window, parent=None):
+    if parent is not None:
+        handle = parent.windowHandle()
+        if handle and handle.screen():
+            return handle.screen()
+        screen = QGuiApplication.screenAt(parent.frameGeometry().center())
+        if screen:
+            return screen
+    rect, screens = window.frameGeometry(), QGuiApplication.screens()
+    if screens:
+        def overlap(screen):
+            intersection = rect.intersected(screen.availableGeometry())
+            return intersection.width() * intersection.height()
+        best = max(screens, key=overlap)
+        if overlap(best) > 0:
+            return best
+    return QGuiApplication.primaryScreen()
+
+
+def _fit_window_to_screen(window, parent=None) -> None:
+    if window.isMaximized() or window.isFullScreen():
+        return
+    screen = _preferred_screen(window, parent)
+    if screen:
+        frame = window.frameGeometry()
+        fitted = _fit_rect_to_available(frame, screen.availableGeometry())
+        frame_extra_width = max(0, frame.width() - window.width())
+        frame_extra_height = max(0, frame.height() - window.height())
+        window.resize(max(1, fitted.width() - frame_extra_width), max(1, fitted.height() - frame_extra_height))
+        window.move(fitted.topLeft())
+        # QWidget.move() and native frame origins can differ by the DPI-scaled
+        # decoration margins. Correct once using Qt's reported frame geometry.
+        actual = window.frameGeometry()
+        window.move(window.x() + fitted.x() - actual.x(), window.y() + fitted.y() - actual.y())
 
 
 class TaskThread(QThread):
     progress = Signal(str, str, int, int)
     result = Signal(object)
     failed = Signal(str)
+    cancelled = Signal(str)
 
     def __init__(self, fn: Callable[[Callable[[str, str, int, int], None]], Any], parent=None):
         super().__init__(parent)
@@ -147,7 +193,7 @@ class TaskThread(QThread):
                 self.progress.emit(*pending)
             self.result.emit(value)
         except TaskCancelled as e:
-            self.failed.emit(str(e))
+            self.cancelled.emit(str(e))
         except Exception as e:
             self.failed.emit(f"{e}\n\n{traceback.format_exc(limit=4)}")
 
@@ -269,7 +315,11 @@ class SettingsDialog(QDialog):
         self.resize(720, 640)
         outer = QVBoxLayout(self)
         tabs = QTabWidget()
-        outer.addWidget(tabs)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(tabs)
+        outer.addWidget(scroll, 1)
 
         general = QWidget()
         form = QFormLayout(general)
@@ -355,6 +405,8 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+        self.button_box = buttons
+        QTimer.singleShot(0, lambda: _fit_window_to_screen(self, parent))
 
     def _import_managed_sites(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "관리회사 설정 파일", "", "JSON (*.json)")
@@ -447,6 +499,9 @@ class MainWindow(QMainWindow):
         self._property_sort_order = Qt.AscendingOrder
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1450, 860)
+        saved_geometry = QSettings().value("main_window_geometry")
+        if saved_geometry:
+            self.restoreGeometry(saved_geometry)
         self._build_ui()
         self.refresh_all()
         self.auto_timer = QTimer(self)
@@ -461,6 +516,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(5000, lambda: self.collect_all(automatic=True))
         if "--autostart" in sys.argv:
             QTimer.singleShot(0, self.showMinimized)
+        else:
+            QTimer.singleShot(0, lambda: _fit_window_to_screen(self))
 
     def _apply_automation_defaults(self) -> None:
         if self.db.get_bool("automation_035_initialized", False):
@@ -672,6 +729,7 @@ class MainWindow(QMainWindow):
             if QMessageBox.question(self, "종료", "수집/동기화 작업이 진행 중입니다. 그래도 종료할까요?") != QMessageBox.Yes:
                 event.ignore()
                 return
+        QSettings().setValue("main_window_geometry", self.saveGeometry())
         self.db.close()
         event.accept()
 
@@ -758,6 +816,15 @@ class MainWindow(QMainWindow):
         self.status.setText("현재 요청이 끝나는 즉시 안전하게 취소합니다…")
         self.append_log("⚠ 작업 취소 요청 · 현재 HTTP/페이지 처리 단위가 끝난 뒤 중단합니다.")
 
+    def _task_cancelled(self, message: str) -> None:
+        self.set_busy(False)
+        self.status.setText("사용자 취소")
+        self.append_log(f"⚠ {message}")
+        self.refresh_sites()
+        self.refresh_wp_label()
+        QTimer.singleShot(0, self.refresh_properties)
+        self.task = None
+
     def start_task(self, fn, *, done_message: str = "완료", after=None, on_fail=None, refresh_on_finish: bool = True, quiet_fail: bool = False) -> None:
         if self.task and self.task.isRunning():
             QMessageBox.information(self, "작업 중", "현재 작업이 끝난 후 다시 시도해 주세요.")
@@ -795,6 +862,7 @@ class MainWindow(QMainWindow):
 
         self.task.result.connect(finish)
         self.task.failed.connect(fail)
+        self.task.cancelled.connect(self._task_cancelled)
         self.task.start()
 
     def on_progress(self, code: str, message: str, current: int, total: int) -> None:
