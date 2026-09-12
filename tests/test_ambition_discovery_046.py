@@ -75,6 +75,8 @@ class FakeDB:
     def get_bool(self, *_args): return True
     def set_site_status(self, *_args, **_kwargs): pass
     def finish_scan(self, _scan_id, values): self.finished = values
+    def save_inventory_snapshot(self, *_args, **_kwargs): return {"expected_count": 1}
+    def properties_by_source_site(self, _site): return {}
 
 
 def test_full_scan_counts_404_as_inactive_skip(monkeypatch):

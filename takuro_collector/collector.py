@@ -76,6 +76,7 @@ class CollectorEngine:
                 discovery = adapter.discover(self.fetcher)
                 urls = list(discovery.urls)
                 hints = dict(getattr(discovery, "hints", {}) or {})
+                inventory_items = dict(getattr(discovery, "inventory_items", {}) or {})
                 result.listed_count += int(getattr(discovery, "listed_count", 0) or len(urls))
                 result.messages.extend(list(getattr(discovery, "messages", []) or []))
                 if not urls:
@@ -86,7 +87,8 @@ class CollectorEngine:
                 # filtering so already-registered live listings remain present in
                 # the snapshot and are never falsely marked as gone.
                 if bool(getattr(discovery, "inventory_complete", False)):
-                    snapshot_items = [hints[u] for u in urls if u in hints]
+                    source_items = inventory_items or hints
+                    snapshot_items = [source_items[u] for u in urls if u in source_items]
                     if len(snapshot_items) == len(urls):
                         snap = self.db.save_inventory_snapshot(
                             adapter.code,
@@ -145,6 +147,11 @@ class CollectorEngine:
                         urls = allowed
 
                 pending_candidates: list[PropertyCandidate] = []
+                precheck = getattr(adapter, "existing_inventory_action", None)
+                existing_by_id = (
+                    self.db.properties_by_source_site(str(getattr(discovery, "inventory_site", "") or ""))
+                    if callable(precheck) and inventory_items else {}
+                )
 
                 def flush_candidates() -> None:
                     nonlocal site_total, site_new
@@ -163,7 +170,12 @@ class CollectorEngine:
                         # A WordPress candidate must arrive with its TXT and photos
                         # already staged. Download only when this local property has
                         # no completed photos, so later scans do not repeat the work.
-                        if not manager.local_photo_paths(property_id):
+                        photo_rows = self.db.photos(property_id)
+                        has_photo_work = any(
+                            str(row.get("status") or "pending") not in {"downloaded", "duplicate"}
+                            for row in photo_rows
+                        )
+                        if not manager.local_photo_paths(property_id) or (adapter.code == "AMB" and has_photo_work):
                             photo_result = manager.download_for_property(property_id)
                             if photo_result.get("failed"):
                                 result.messages.append(
@@ -173,8 +185,23 @@ class CollectorEngine:
                     pending_candidates.clear()
 
                 for uidx, url in enumerate(urls, start=1):
+                    item = inventory_items.get(url, {})
+                    source_id = str(item.get("source_property_id") or "")
+                    existing = existing_by_id.get(source_id) if source_id else None
+                    if existing is not None and callable(precheck):
+                        action = precheck(existing, item)
+                        if action == "unchanged":
+                            site_total += 1
+                            result.discovered += 1
+                            result.existing_count += 1
+                            if progress:
+                                progress(adapter.code, f"{adapter.label} {uidx}/{len(urls)} - 기존/변화없음, 상세 생략", index, len(enabled))
+                            continue
+                        reason = "변경 감지, 상세 재확인" if action == "changed" else "기존, 정기 재확인"
+                    else:
+                        reason = "신규, 상세 수집"
                     if progress:
-                        progress(adapter.code, f"{adapter.label} {uidx}/{len(urls)}", index, len(enabled))
+                        progress(adapter.code, f"{adapter.label} {uidx}/{len(urls)} - {reason}", index, len(enabled))
                     try:
                         result.detail_attempted += 1
                         candidate = adapter.collect_url(self.fetcher, url)

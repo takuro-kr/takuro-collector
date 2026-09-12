@@ -326,6 +326,10 @@ class Database:
         ).fetchone()
         return self._decode_property(row) if row else None
 
+    def properties_by_source_site(self, source_site: str) -> dict[str, dict]:
+        rows = self.conn.execute("SELECT * FROM properties WHERE source_site=?", (source_site,)).fetchall()
+        return {str(row["source_property_id"]): self._decode_property(row) for row in rows}
+
     def property_by_ready_fallback(self, source_site: str, building_name: str, room: str) -> dict | None:
         """Return a unique same-site building+room match for a ready candidate.
 

@@ -34,6 +34,7 @@ class DiscoveryResult:
     # snapshots are eligible for outgoing-listing detection.
     inventory_complete: bool = False
     inventory_site: str = ""
+    inventory_items: dict[str, dict] = field(default_factory=dict)
 
 
 class BaseAdapter:

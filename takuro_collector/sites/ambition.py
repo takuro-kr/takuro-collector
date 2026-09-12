@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -156,10 +157,12 @@ class AmbitionAdapter(BaseAdapter):
     detail_patterns = (r"/rent/\d+/(\d+)(?:$|[/?#])",)
     force_browser = True
     login_expected = True
+    detail_refresh_ttl = timedelta(days=30)
 
     def discover(self, fetcher) -> DiscoveryResult:
         """Walk only AMB's live room tables and their explicit next links."""
         urls: list[str] = []
+        inventory_items: dict[str, dict] = {}
         seen_urls: set[str] = set()
         seen_pages: set[str] = set()
         any_browser = False
@@ -181,6 +184,30 @@ class AmbitionAdapter(BaseAdapter):
                     if canonical not in seen_urls:
                         seen_urls.add(canonical)
                         urls.append(canonical)
+                    row = anchor.find_parent("tr")
+                    cells = row.find_all("td", recursive=False) if row else []
+                    facts: dict[str, object] = {}
+                    if len(cells) >= 5:
+                        floor_match = re.search(r"(\d+)\s*階", cells[1].get_text(" ", strip=True))
+                        layout_area = cells[2].get_text(" ", strip=True)
+                        layout_match = re.search(r"([0-9]+(?:LDK|DK|K|R|SLDK))", layout_area, re.I)
+                        area_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:m²|㎡)", layout_area, re.I)
+                        prices = [_yen(x) for x in cells[3].stripped_strings]
+                        prices = [x for x in prices if x]
+                        if floor_match:
+                            facts["floor"] = f"{int(floor_match.group(1))}階"
+                        if layout_match:
+                            facts["layout"] = layout_match.group(1).upper()
+                        if area_match:
+                            facts["area"] = float(area_match.group(1))
+                        if prices:
+                            facts["rent"] = prices[0]
+                        if len(prices) > 1:
+                            facts["management_fee"] = prices[1]
+                    inventory_items[canonical] = {
+                        "source_property_id": identity[1], "source_url": canonical,
+                        "change_facts": facts,
+                    }
                 next_anchor = soup.select_one("a.next[href]")
                 next_url = urljoin(result.url, str(next_anchor.get("href") or "")) if next_anchor else ""
                 parsed_next = urlparse(next_url)
@@ -189,7 +216,34 @@ class AmbitionAdapter(BaseAdapter):
                         or not re.fullmatch(rf"{re.escape(seed_path)}(?:/page:\d+)?", next_path)):
                     next_url = ""
                 page_url = next_url
-        return DiscoveryResult(urls, any_browser, listed_count=len(urls))
+        return DiscoveryResult(
+            urls, any_browser, listed_count=len(urls), inventory_complete=True,
+            inventory_site="pm.am-bition.jp", inventory_items=inventory_items,
+        )
+
+    def existing_inventory_action(self, existing: dict, item: dict, *, now: datetime | None = None) -> str:
+        facts = dict(item.get("change_facts") or {})
+        for key in ("rent", "management_fee", "layout", "area"):
+            if key not in facts:
+                continue
+            old, new = existing.get(key), facts[key]
+            if key == "area":
+                if old is None or abs(float(old) - float(new)) > 0.001:
+                    return "changed"
+            elif key == "layout":
+                old_layout = re.search(r"[0-9]+(?:LDK|DK|K|R|SLDK)", str(old or ""), re.I)
+                if not old_layout or old_layout.group(0).upper() != str(new).upper():
+                    return "changed"
+            elif str(old or "").strip() != str(new or "").strip():
+                return "changed"
+        try:
+            refreshed = datetime.fromisoformat(str(existing.get("last_seen_at") or ""))
+            if refreshed.tzinfo is None:
+                refreshed = refreshed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return "ttl"
+        current = now or datetime.now(timezone.utc).astimezone()
+        return "ttl" if current - refreshed >= self.detail_refresh_ttl else "unchanged"
 
     @staticmethod
     def _is_inactive_detail(status_code: int, html: str) -> bool:
