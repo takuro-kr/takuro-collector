@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 from bs4 import BeautifulSoup
 
@@ -16,6 +17,38 @@ def _yen(value: str) -> int:
 def _zero_or_text(value: str) -> str:
     text = (value or "").strip()
     return "0" if text in {"なし", "無し", "無", "0円", "-"} else text
+
+
+def _transport_routes(soup: BeautifulSoup) -> list[dict]:
+    """Parse every AMB route from its comma-separated 交通 table cell."""
+    result: list[dict] = []
+    seen: set[str] = set()
+    for row in soup.find_all("tr"):
+        cells = row.find_all(["th", "td"])
+        if len(cells) < 2 or cells[0].get_text(" ", strip=True) != "交通":
+            continue
+        for raw_cell in cells[1:]:
+            for segment in re.split(r"\s*[、]\s*", raw_cell.get_text(" ", strip=True)):
+                raw = segment.strip()
+                if not raw or raw in seen:
+                    continue
+                seen.add(raw)
+                match = re.fullmatch(
+                    r"(?P<line>.+?)/(?P<station>.+?)\s+(?:徒歩|歩)(?P<walk>[0-9０-９]+)分",
+                    raw,
+                )
+                if match:
+                    result.append({
+                        "line": match.group("line").strip(),
+                        "station": match.group("station").strip(),
+                        "walk_minutes": int(unicodedata.normalize("NFKC", match.group("walk"))),
+                        "raw": raw,
+                    })
+                else:
+                    # Preserve the source verbatim when AMB introduces a new
+                    # expression; never invent missing line/station/time data.
+                    result.append({"raw": raw})
+    return result[:10]
 
 
 class AmbitionAdapter(BaseAdapter):
@@ -50,7 +83,7 @@ class AmbitionAdapter(BaseAdapter):
         deposit = str(data.get("deposit") or "")
         key_money = str(data.get("key_money") or "")
 
-        # The first price-plan row is the site's primary advertised plan.
+        # AMB advertises multiple price plans in a dedicated table.
         # Generic extraction cannot associate these column headers with values.
         for table in soup.find_all("table"):
             rows = table.find_all("tr")
@@ -90,6 +123,7 @@ class AmbitionAdapter(BaseAdapter):
         prefecture = str(data.get("prefecture") or "").strip()
         if not building_name or not address or not prefecture:
             raise ValueError("AMB 건물명/주소 추출 실패")
+        transport = _transport_routes(soup) or list(data.get("transport") or [])
         return PropertyCandidate(
             source_site=canonical_host(url),
             source_property_id=source_id,
@@ -111,7 +145,7 @@ class AmbitionAdapter(BaseAdapter):
             structure=str(data.get("structure") or ""),
             orientation=str(data.get("orientation") or ""),
             move_in_date=str(data.get("move_in_date") or ""),
-            transport=list(data.get("transport") or []),
+            transport=transport,
             equipment=list(data.get("equipment") or []),
             photo_sources=list(data.get("photo_sources") or []),
             source_id_kind=source_id_kind,
