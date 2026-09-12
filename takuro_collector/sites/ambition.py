@@ -17,6 +17,7 @@ def _zero_or_text(value: str) -> str:
     text = (value or "").strip()
     return "0" if text in {"なし", "無し", "無", "0円", "-"} else text
 
+
 class AmbitionAdapter(BaseAdapter):
     code = "AMB"
     label = "アンビション"
@@ -58,9 +59,17 @@ class AmbitionAdapter(BaseAdapter):
             headers = [cell.get_text(" ", strip=True) for cell in rows[0].find_all(["th", "td"])]
             if "賃料" not in headers or not any("管理費" in h or "共益費" in h for h in headers):
                 continue
-            values = [cell.get_text(" ", strip=True) for cell in rows[1].find_all(["th", "td"])]
-            if len(values) != len(headers):
+            value_rows = [
+                [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+                for row in rows[1:]
+            ]
+            value_rows = [values for values in value_rows if len(values) == len(headers) and _yen(values[headers.index("賃料")])]
+            if not value_rows:
                 continue
+            # Register the cheapest advertised monthly-rent plan. min() is
+            # stable, so equal-price plans retain the site's display order.
+            rent_index = headers.index("賃料")
+            values = min(value_rows, key=lambda item: _yen(item[rent_index]))
             row = dict(zip(headers, values))
             rent = _yen(row.get("賃料", ""))
             fee_key = next((h for h in headers if "管理費" in h or "共益費" in h), "")
