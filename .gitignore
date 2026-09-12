@@ -45,6 +45,9 @@ collected/
 data/
 output/
 outputs/
+release-output/
+*.pem
+*.key
 screenshots/
 traces/
 tests/.tmp_home/

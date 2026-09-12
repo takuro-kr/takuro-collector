@@ -12,6 +12,7 @@ import tempfile
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
@@ -22,7 +23,10 @@ from .paths import data_root
 SCHEMA_VERSION = 1
 MAX_PACKAGE_SIZE = 350 * 1024 * 1024
 EXECUTABLE_NAME = "TAKURO Collector.exe"
-PUBLIC_UPDATE_KEY_B64 = ""
+UPDATE_HOST = "updates.takuro.tech"
+UPDATE_MANIFEST_URL = f"https://{UPDATE_HOST}/latest.json"
+ALLOWED_UPDATE_HOSTS = frozenset({UPDATE_HOST})
+PUBLIC_UPDATE_KEY_B64 = "7DUSa7wC7c3t7Sba+Ab1iZdOiMShDbvQyumRG70PH5g="
 
 
 class UpdateError(RuntimeError):
@@ -78,10 +82,11 @@ def verify_signature(payload: dict, public_key_b64: str) -> None:
 
 
 def check(manifest_url: str, current_version: str, *, timeout: int = 15,
-          allowed_hosts: set[str] | None = None, public_key_b64: str = PUBLIC_UPDATE_KEY_B64,
+          allowed_hosts: set[str] | frozenset[str] = ALLOWED_UPDATE_HOSTS,
+          public_key_b64: str = PUBLIC_UPDATE_KEY_B64,
           require_signature: bool = True) -> UpdateInfo | None:
     manifest_host = _https_host(manifest_url)
-    hosts = {host.lower() for host in (allowed_hosts or {manifest_host})}
+    hosts = {host.lower() for host in allowed_hosts}
     if manifest_host not in hosts:
         raise UpdateError("허용되지 않은 업데이트 서버입니다.")
     try:
@@ -101,6 +106,19 @@ def check(manifest_url: str, current_version: str, *, timeout: int = 15,
     notes = payload.get("release_notes", [])
     if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
         raise UpdateError("업데이트 변경 내용 형식이 올바르지 않습니다.")
+    try:
+        published_at = datetime.fromisoformat(str(payload.get("published_at") or ""))
+        if published_at.tzinfo is None:
+            raise ValueError
+    except ValueError as exc:
+        raise UpdateError("업데이트 게시 시각 형식이 올바르지 않습니다.") from exc
+    expected_package = {
+        "format": "pyinstaller-onedir-zip",
+        "executable": EXECUTABLE_NAME,
+        "metadata": {"schema_version": SCHEMA_VERSION, "version": str(payload.get("version") or "")},
+    }
+    if payload.get("package") != expected_package:
+        raise UpdateError("업데이트 package 정보가 올바르지 않습니다.")
     info = UpdateInfo(str(payload.get("version") or ""), str(payload.get("download_url") or ""),
                       str(payload.get("sha256") or "").lower(), int(payload.get("size") or 0),
                       tuple(notes), str(payload.get("signature") or ""))
@@ -115,6 +133,8 @@ def check(manifest_url: str, current_version: str, *, timeout: int = 15,
 
 
 def download(info: UpdateInfo, *, timeout: int = 120) -> Path:
+    if _https_host(info.url) not in ALLOWED_UPDATE_HOSTS:
+        raise UpdateError("허용되지 않은 업데이트 다운로드 서버입니다.")
     target_dir = data_root() / "updates" / "downloads"
     target_dir.mkdir(parents=True, exist_ok=True)
     final_path = target_dir / f"TAKURO-Collector-{info.version}-Windows.zip"
@@ -130,6 +150,8 @@ def download(info: UpdateInfo, *, timeout: int = 120) -> Path:
         with response_context as response:
             if not response.ok:
                 raise UpdateError(f"업데이트 다운로드 실패: HTTP {response.status_code}")
+            if _https_host(str(getattr(response, "url", info.url))) not in ALLOWED_UPDATE_HOSTS:
+                raise UpdateError("업데이트 다운로드가 허용되지 않은 서버로 이동했습니다.")
             with temp_path.open("wb") as output:
                 for chunk in response.iter_content(1024 * 1024):
                     if chunk:

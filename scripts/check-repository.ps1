@@ -4,7 +4,7 @@ $forbiddenNames = @(
     'collector.db', '*.sqlite', '*.sqlite3', '.env', '.env.*',
     '*cookie*', '*credential*', '*secret*', 'storage-state*.json',
     '*.exe', '*.zip', '*.pdf', '*.csv', '*.tsv',
-    '*.jpg', '*.jpeg', '*.png', '*.webp'
+    '*.jpg', '*.jpeg', '*.png', '*.webp', '*.pem', '*.key'
 )
 
 $tracked = @(git ls-files)

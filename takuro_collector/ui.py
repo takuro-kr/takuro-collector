@@ -288,7 +288,9 @@ class SettingsDialog(QDialog):
         self.retry_interval.setRange(1, 120)
         self.retry_interval.setSuffix(" 분")
         self.retry_interval.setValue(int(db.get_setting("auto_retry_interval_minutes", "10") or 10))
-        self.update_manifest = QLineEdit(db.get_setting("update_manifest_url", ""))
+        from .updater import UPDATE_MANIFEST_URL
+        manifest_url = db.get_setting("update_manifest_url", "").strip() or UPDATE_MANIFEST_URL
+        self.update_manifest = QLineEdit(manifest_url)
         self.update_manifest.setPlaceholderText("https://.../update-manifest.json")
         form.addRow("브라우저", self.visible_browser)
         form.addRow("Windows 자동 실행", self.windows_start)
@@ -1119,7 +1121,8 @@ class MainWindow(QMainWindow):
             self.refresh_wp_label()
 
     def check_for_updates(self) -> None:
-        manifest_url = self.db.get_setting("update_manifest_url", "").strip()
+        from .updater import UPDATE_MANIFEST_URL
+        manifest_url = self.db.get_setting("update_manifest_url", "").strip() or UPDATE_MANIFEST_URL
         if not manifest_url:
             QMessageBox.information(
                 self,

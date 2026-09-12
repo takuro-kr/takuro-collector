@@ -3,10 +3,12 @@ import hashlib
 import io
 import json
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
 from takuro_collector import updater, updater_helper
+from scripts import release_update
 
 
 class Response:
@@ -22,41 +24,51 @@ class Response:
 
 def manifest(**changes):
     value = {"schema_version": 1, "version": "0.4.5", "published_at": "2026-09-12T00:00:00+09:00",
-             "download_url": "https://updates.example/app.zip", "sha256": "a" * 64, "size": 10,
-             "release_notes": ["AMM 수집 지원"], "signature": "test"}
+             "download_url": "https://updates.takuro.tech/releases/0.4.5/TAKURO-Collector-0.4.5.zip",
+             "sha256": "a" * 64, "size": 10, "release_notes": ["AMM 수집 지원"],
+             "package": {"format": "pyinstaller-onedir-zip", "executable": "TAKURO Collector.exe",
+                         "metadata": {"schema_version": 1, "version": "0.4.5"}}, "signature": "test"}
     value.update(changes)
     return value
+
+
+def test_production_endpoint_allowlist_and_embedded_public_key_are_fixed():
+    assert updater.UPDATE_HOST == "updates.takuro.tech"
+    assert updater.UPDATE_MANIFEST_URL == "https://updates.takuro.tech/latest.json"
+    assert updater.ALLOWED_UPDATE_HOSTS == {"updates.takuro.tech"}
+    assert len(base64.b64decode(updater.PUBLIC_UPDATE_KEY_B64, validate=True)) == 32
 
 
 def test_update_check_newer_current_and_validation(monkeypatch):
     payload = manifest()
     monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: Response(payload))
-    assert updater.check("https://updates.example/manifest.json", "0.4.4", require_signature=False).version == "0.4.5"
-    assert updater.check("https://updates.example/manifest.json", "0.4.5", require_signature=False) is None
+    assert updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", require_signature=False).version == "0.4.5"
+    assert updater.check(updater.UPDATE_MANIFEST_URL, "0.4.5", require_signature=False) is None
     with pytest.raises(updater.UpdateError, match="HTTPS"):
-        updater.check("http://updates.example/manifest.json", "0.4.4", require_signature=False)
+        updater.check("http://updates.takuro.tech/latest.json", "0.4.4", require_signature=False)
     payload["schema_version"] = 2
     with pytest.raises(updater.UpdateError, match="지원하지 않는"):
-        updater.check("https://updates.example/manifest.json", "0.4.4", require_signature=False)
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", require_signature=False)
 
 
 @pytest.mark.parametrize("change", [{"version": "bad"}, {"sha256": "bad"}, {"size": 0},
     {"size": updater.MAX_PACKAGE_SIZE + 1}, {"download_url": "http://updates.example/app.zip"},
-    {"download_url": "https://evil.example/app.zip"}, {"release_notes": "bad"}])
+    {"download_url": "https://evil.example/app.zip"}, {"release_notes": "bad"}, {"package": {}},
+    {"published_at": "2026-09-12"}])
 def test_malformed_manifest_is_rejected(monkeypatch, change):
     monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: Response(manifest(**change)))
     with pytest.raises(updater.UpdateError):
-        updater.check("https://updates.example/manifest.json", "0.4.4", require_signature=False)
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", require_signature=False)
 
 
 def test_manifest_http_and_json_failures(monkeypatch):
     response = Response({}); response.ok, response.status_code = False, 503
     monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: response)
     with pytest.raises(updater.UpdateError, match="503"):
-        updater.check("https://updates.example/manifest.json", "0.4.4", require_signature=False)
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", require_signature=False)
     monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: Response(ValueError()))
     with pytest.raises(updater.UpdateError, match="JSON"):
-        updater.check("https://updates.example/manifest.json", "0.4.4", require_signature=False)
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", require_signature=False)
 
 
 def test_ed25519_signature_success_and_failure():
@@ -71,15 +83,35 @@ def test_ed25519_signature_success_and_failure():
     with pytest.raises(updater.UpdateError, match="서명"): updater.verify_signature(payload, public)
 
 
+def test_signed_production_manifest_accepts_right_key_and_rejects_wrong_key_or_tampering(monkeypatch):
+    crypto = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ed25519")
+    from cryptography.hazmat.primitives import serialization
+    private = crypto.Ed25519PrivateKey.generate()
+    other = crypto.Ed25519PrivateKey.generate()
+    encode_public = lambda key: base64.b64encode(key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    payload = manifest(signature="")
+    payload["signature"] = base64.b64encode(private.sign(updater._signed_payload(payload))).decode()
+    monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: Response(payload))
+    assert updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", public_key_b64=encode_public(private))
+    with pytest.raises(updater.UpdateError, match="서명"):
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", public_key_b64=encode_public(other))
+    payload["size"] += 1
+    with pytest.raises(updater.UpdateError, match="서명"):
+        updater.check(updater.UPDATE_MANIFEST_URL, "0.4.4", public_key_b64=encode_public(private))
+
+
 def test_download_verifies_size_sha_and_cleans_failure(tmp_path, monkeypatch):
     content = b"verified update archive"
-    info = updater.UpdateInfo("0.4.5", "https://updates.example/app.zip", hashlib.sha256(content).hexdigest(), len(content))
+    info = updater.UpdateInfo("0.4.5", "https://updates.takuro.tech/releases/0.4.5/app.zip", hashlib.sha256(content).hexdigest(), len(content))
     monkeypatch.setattr(updater, "data_root", lambda: tmp_path)
     monkeypatch.setattr(updater.requests, "get", lambda *_a, **_k: Response(content=content))
     assert updater.download(info).read_bytes() == content
     with pytest.raises(updater.UpdateError, match="SHA-256"):
         updater.download(updater.UpdateInfo("0.4.6", info.url, "0" * 64, len(content)))
     assert not list((tmp_path / "updates" / "downloads").glob("takuro-update-*"))
+    with pytest.raises(updater.UpdateError, match="허용되지 않은"):
+        updater.download(updater.UpdateInfo("0.4.6", "https://evil.example/app.zip", "0" * 64, 1))
 
 
 def zip_bytes(entries):
@@ -91,7 +123,7 @@ def zip_bytes(entries):
 
 def test_stage_accepts_onedir_and_rejects_zip_slip(tmp_path, monkeypatch):
     monkeypatch.setattr(updater, "data_root", lambda: tmp_path)
-    info = updater.UpdateInfo("0.4.5", "https://updates.example/app.zip", "a" * 64, 1)
+    info = updater.UpdateInfo("0.4.5", "https://updates.takuro.tech/releases/0.4.5/app.zip", "a" * 64, 1)
     good = tmp_path / "good.zip"
     good.write_bytes(zip_bytes({"TAKURO Collector.exe": b"exe", "TAKURO Updater.exe": b"helper",
                                 "_internal/runtime.dll": b"dll",
@@ -100,6 +132,23 @@ def test_stage_accepts_onedir_and_rejects_zip_slip(tmp_path, monkeypatch):
     bad = tmp_path / "bad.zip"; bad.write_bytes(zip_bytes({"../escape.txt": b"bad"}))
     with pytest.raises(updater.UpdateError, match="안전하지 않은"): updater.stage(info, bad)
     assert not (tmp_path / "escape.txt").exists()
+
+
+def test_release_tool_creates_verifiable_static_server_files(tmp_path):
+    private = tmp_path / "signing" / "private.pem"
+    public = tmp_path / "signing" / "public.txt"
+    release_update.generate_key(private, public)
+    archive = tmp_path / "build.zip"
+    archive.write_bytes(zip_bytes({"TAKURO Collector.exe": b"exe", "TAKURO Updater.exe": b"helper",
+        "_internal/runtime.dll": b"dll", "update-package.json": b'{"schema_version":1,"version":"0.4.5"}'}))
+    latest, release_zip = release_update.prepare(SimpleNamespace(
+        private_key=private, zip=archive, version="0.4.5", output=tmp_path / "release-output",
+        note=["AMM 수집 지원"]
+    ))
+    payload = json.loads(latest.read_text(encoding="utf-8"))
+    updater.verify_signature(payload, public.read_text(encoding="ascii").strip())
+    assert payload["download_url"] == "https://updates.takuro.tech/releases/0.4.5/TAKURO-Collector-0.4.5.zip"
+    assert release_zip.read_bytes() == archive.read_bytes()
 
 
 class Process:
