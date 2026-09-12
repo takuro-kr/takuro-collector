@@ -9,11 +9,48 @@ import time
 from pathlib import Path
 
 
+def _wait_exit_windows(pid: int, timeout: float) -> bool:
+    """Wait for a Windows process handle; PID 87 means it is already gone."""
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    wait_object_0, wait_timeout, wait_failed = 0, 258, 0xFFFFFFFF
+    error_invalid_parameter = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(synchronize, False, int(pid))
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == error_invalid_parameter:
+            return True
+        raise ctypes.WinError(error)
+    try:
+        milliseconds = max(0, min(int(max(timeout, 0) * 1000), 0xFFFFFFFE))
+        result = kernel32.WaitForSingleObject(handle, milliseconds)
+        if result == wait_object_0:
+            return True
+        if result == wait_timeout:
+            return False
+        if result == wait_failed:
+            raise ctypes.WinError(ctypes.get_last_error())
+        raise OSError(f"예상하지 못한 Windows process wait 결과: {result}")
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _state(root: Path, value: str, error: str = "") -> None:
     (root / "state.json").write_text(json.dumps({"state": value, "error": error}, ensure_ascii=False), encoding="utf-8")
 
 
 def _wait_exit(pid: int, timeout: float = 30) -> bool:
+    if os.name == "nt":
+        return _wait_exit_windows(pid, timeout)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:

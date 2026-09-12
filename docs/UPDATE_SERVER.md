@@ -28,7 +28,7 @@
 ```powershell
 BUILD_EXE.bat
 .\.venv\Scripts\python.exe scripts\release_update.py prepare `
-  --version 0.4.6 `
+  --version 0.4.7 `
   --zip .\TAKURO-Collector-Portable-Windows.zip `
   --private-key "$env:USERPROFILE\.takuro-signing\update-ed25519-private.pem" `
   --output .\release-output `
@@ -37,4 +37,4 @@ BUILD_EXE.bat
   --note "AMB 4개 현 목록 discovery 및 stale 매물 처리"
 ```
 
-서버에는 `release-output/latest.json`과 `release-output/releases/0.4.6/TAKURO-Collector-0.4.6.zip`만 업로드합니다.
+서버에는 `release-output/latest.json`과 `release-output/releases/0.4.7/TAKURO-Collector-0.4.7.zip`만 업로드합니다.

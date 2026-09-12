@@ -6,6 +6,9 @@ import zipfile
 from types import SimpleNamespace
 
 import pytest
+import os
+import subprocess
+import sys
 
 from takuro_collector import updater, updater_helper
 from scripts import release_update
@@ -192,3 +195,31 @@ def test_helper_rejects_duplicate_install(tmp_path):
     command, _install, user, _marker = install_fixture(tmp_path)
     (user / "updates").mkdir(); (user / "updates" / "install.lock").write_text("locked")
     with pytest.raises(FileExistsError): updater_helper.install(command, timeout=.01, wait_exit=lambda *_: True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle regression")
+def test_windows_wait_reports_live_parent():
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    try:
+        assert updater_helper._wait_exit(process.pid, .05) is False
+    finally:
+        process.terminate(); process.wait(5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle regression")
+def test_windows_wait_observes_parent_normal_exit():
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(.1)"])
+    assert updater_helper._wait_exit(process.pid, 5) is True
+    process.wait(5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle regression")
+def test_windows_wait_accepts_already_exited_pid():
+    process = subprocess.Popen([sys.executable, "-c", "pass"])
+    process.wait(5)
+    assert updater_helper._wait_exit(process.pid, .1) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process handle regression")
+def test_windows_wait_accepts_nonexistent_pid():
+    assert updater_helper._wait_exit(0x7FFFFFFF, .1) is True
