@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -51,6 +52,96 @@ def _transport_routes(soup: BeautifulSoup) -> list[dict]:
     return result[:10]
 
 
+_AMB_DETAIL_PATH = re.compile(r"^/rent/(?P<building_id>\d+)/(?P<room_id>\d+)/?$")
+_CACHE_IMAGE_KEY = re.compile(r"(?:^|/)(?:\d+x\d+_)?(?P<key>[0-9a-f]{32})\.(?:jpe?g|png|webp)(?:$|[?#])", re.I)
+_BUILDING_COMMON_LABELS = (
+    "メールボックス", "宅配ボックス", "エレベーター", "エレベーターホール",
+    "エントランス", "エントランスホール", "ロビー", "廊下", "共用", "集合ポスト",
+    "オートロック", "電子ロック",
+)
+
+
+def _detail_identity(url: str) -> tuple[str, str] | None:
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != "pm.am-bition.jp":
+        return None
+    match = _AMB_DETAIL_PATH.fullmatch(parsed.path)
+    if not match:
+        return None
+    return match.group("building_id"), match.group("room_id")
+
+
+def _parent_building_url(url: str) -> str | None:
+    identity = _detail_identity(url)
+    if not identity:
+        return None
+    building_id, _ = identity
+    return f"https://pm.am-bition.jp/rent/{building_id}/"
+
+
+def _cache_image_key(url: str) -> str:
+    match = _CACHE_IMAGE_KEY.search(url or "")
+    return match.group("key").lower() if match else ""
+
+
+def _allowed_image_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme.lower() == "https" and (parsed.hostname or "").lower() == "pm.am-bition.jp"
+
+
+def _room_photo_sources(soup: BeautifulSoup, page_url: str, room_id: str) -> list[dict]:
+    side_keys: set[str] = set()
+    for node in soup.select("#side_roomplan img, #side_roomplan a[href]"):
+        value = node.get("src") or node.get("href") or ""
+        key = _cache_image_key(urljoin(page_url, str(value)))
+        if key:
+            side_keys.add(key)
+
+    result: list[dict] = []
+    seen: set[str] = set()
+    expected = re.compile(rf"^/img/upload/rent_room/\d+/{re.escape(room_id)}/[^/]+$")
+    for anchor in soup.select("#room_photo #room_photo_album .photo_view a[href]"):
+        url = urljoin(page_url, str(anchor.get("href") or ""))
+        if not _allowed_image_url(url) or not expected.fullmatch(urlparse(url).path) or url in seen:
+            continue
+        image = anchor.find("img")
+        label = ""
+        cache_key = ""
+        if image:
+            label = str(image.get("alt") or image.get("title") or "").strip()
+            cache_key = _cache_image_key(urljoin(page_url, str(image.get("src") or "")))
+        seen.add(url)
+        result.append({
+            "url": url,
+            "alt": label,
+            "kind": "floorplan" if cache_key and cache_key in side_keys else "interior",
+        })
+    return result
+
+
+def _building_photo_sources(soup: BeautifulSoup, page_url: str, building_id: str) -> list[dict]:
+    result: list[dict] = []
+    seen: set[str] = set()
+    expected = re.compile(rf"^/img/upload/rent_mansion/\d+/{re.escape(building_id)}/[^/]+$")
+    for anchor in soup.select("#room_photo #room_photo_album .photo_view a[href]"):
+        url = urljoin(page_url, str(anchor.get("href") or ""))
+        if not _allowed_image_url(url) or not expected.fullmatch(urlparse(url).path) or url in seen:
+            continue
+        image = anchor.find("img")
+        label = ""
+        if image:
+            label = str(image.get("alt") or image.get("title") or "").strip()
+        if "外観" in label:
+            kind = "exterior"
+        elif any(term in label for term in _BUILDING_COMMON_LABELS):
+            kind = "common_area"
+        else:
+            kind = "other"
+        seen.add(url)
+        result.append({"url": url, "alt": label, "kind": kind})
+    return result
+
+
 class AmbitionAdapter(BaseAdapter):
     code = "AMB"
     label = "アンビション"
@@ -60,6 +151,34 @@ class AmbitionAdapter(BaseAdapter):
     detail_patterns = (r"/rent/\d+/(\d+)(?:$|[/?#])",)
     force_browser = True
     login_expected = True
+
+    def collect_url(self, fetcher, url: str) -> PropertyCandidate:
+        detail = fetcher.fetch(
+            url,
+            self.code,
+            force_browser=self.force_browser,
+            login_expected=self.login_expected,
+        )
+        candidate = self.parse(detail.html, detail.url)
+        identity = _detail_identity(detail.url)
+        parent_url = _parent_building_url(detail.url)
+        if not identity or not parent_url or not self.matches_url(parent_url):
+            return candidate
+        building_id, _ = identity
+        try:
+            building = fetcher.fetch(
+                parent_url,
+                self.code,
+                force_browser=self.force_browser,
+                login_expected=self.login_expected,
+            )
+            if self.matches_url(building.url) and urlparse(building.url).path == urlparse(parent_url).path:
+                candidate.photo_sources.extend(
+                    _building_photo_sources(BeautifulSoup(building.html, "html.parser"), building.url, building_id)
+                )
+        except Exception as exc:
+            candidate.scrape_warnings.append(f"AMB 건물 사진 수집 실패: {exc}")
+        return candidate
 
     def parse(self, html: str, url: str):
         soup = BeautifulSoup(html, "html.parser")
@@ -124,6 +243,8 @@ class AmbitionAdapter(BaseAdapter):
         if not building_name or not address or not prefecture:
             raise ValueError("AMB 건물명/주소 추출 실패")
         transport = _transport_routes(soup) or list(data.get("transport") or [])
+        identity = _detail_identity(url)
+        room_photos = _room_photo_sources(soup, url, identity[1]) if identity else []
         return PropertyCandidate(
             source_site=canonical_host(url),
             source_property_id=source_id,
@@ -147,7 +268,7 @@ class AmbitionAdapter(BaseAdapter):
             move_in_date=str(data.get("move_in_date") or ""),
             transport=transport,
             equipment=list(data.get("equipment") or []),
-            photo_sources=list(data.get("photo_sources") or []),
+            photo_sources=room_photos,
             source_id_kind=source_id_kind,
             scrape_warnings=[],
         )
