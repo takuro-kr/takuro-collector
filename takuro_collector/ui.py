@@ -245,11 +245,14 @@ class SettingsDialog(QDialog):
         self.retry_interval.setRange(1, 120)
         self.retry_interval.setSuffix(" 분")
         self.retry_interval.setValue(int(db.get_setting("auto_retry_interval_minutes", "10") or 10))
+        self.update_manifest = QLineEdit(db.get_setting("update_manifest_url", ""))
+        self.update_manifest.setPlaceholderText("https://.../update-manifest.json")
         form.addRow("브라우저", self.visible_browser)
         form.addRow("Windows 자동 실행", self.windows_start)
         form.addRow("시작 자동수집", self.auto_start)
         form.addRow("자동수집 간격", self.interval)
         form.addRow("실패 후 재시도", self.retry_interval)
+        form.addRow("업데이트 정보 URL", self.update_manifest)
         note = QLabel("노트북 로그인 후 Collector가 자동으로 실행되어 수집하고 TAKURO에 동기화합니다. 노트북은 켜져 있고 인터넷에 연결되어 있어야 합니다.")
         note.setWordWrap(True)
         form.addRow(note)
@@ -342,6 +345,7 @@ class SettingsDialog(QDialog):
         self.db.set_bool("start_with_windows", self.windows_start.isChecked())
         self.db.set_setting("auto_collect_interval_minutes", str(self.interval.value()))
         self.db.set_setting("auto_retry_interval_minutes", str(self.retry_interval.value()))
+        self.db.set_setting("update_manifest_url", self.update_manifest.text().strip())
         set_windows_startup(self.windows_start.isChecked())
         WordPressSync(self.db).save_config(
             self.wp_enabled.isChecked(),
@@ -449,6 +453,9 @@ class MainWindow(QMainWindow):
         self.settings_btn = QPushButton("설정")
         self.settings_btn.clicked.connect(self.open_settings)
         title_row.addWidget(self.settings_btn)
+        self.update_btn = QPushButton("업데이트 확인")
+        self.update_btn.clicked.connect(self.check_for_updates)
+        title_row.addWidget(self.update_btn)
         outer.addLayout(title_row)
 
         buttons = QHBoxLayout()
@@ -971,6 +978,57 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self.configure_timer()
             self.refresh_wp_label()
+
+    def check_for_updates(self) -> None:
+        manifest_url = self.db.get_setting("update_manifest_url", "").strip()
+        if not manifest_url:
+            QMessageBox.information(
+                self,
+                "업데이트 확인",
+                "설정 → 일반에서 업데이트 정보 URL을 먼저 입력해 주세요.",
+            )
+            return
+        if self.task and self.task.isRunning():
+            QMessageBox.information(self, "업데이트 확인", "다른 작업이 끝난 뒤 다시 시도해 주세요.")
+            return
+        from .updater import check, download
+
+        self.update_btn.setEnabled(False)
+        self.status.setText("업데이트 확인 중…")
+
+        def job(_progress):
+            info = check(manifest_url, __version__)
+            if info is None:
+                return {"current": True}
+            path = download(info)
+            return {"current": False, "version": info.version, "notes": info.notes, "path": str(path)}
+
+        task = TaskThread(job, self)
+        self.task = task
+
+        def finish(result):
+            self.update_btn.setEnabled(True)
+            self.task = None
+            if result.get("current"):
+                self.status.setText("최신 버전입니다.")
+                QMessageBox.information(self, "업데이트 확인", f"현재 v{__version__}가 최신 버전입니다.")
+                return
+            self.status.setText(f"v{result['version']} 업데이트 검증 완료")
+            answer = QMessageBox.information(
+                self,
+                "업데이트 다운로드 완료",
+                f"v{result['version']} 파일을 SHA-256 검증했습니다.\n\n{result.get('notes','')}\n\n저장 위치:\n{result['path']}",
+            )
+
+        def fail(message):
+            self.update_btn.setEnabled(True)
+            self.task = None
+            self.status.setText("업데이트 확인 실패")
+            QMessageBox.warning(self, "업데이트 오류", message.split("\n\n", 1)[0])
+
+        task.result.connect(finish)
+        task.failed.connect(fail)
+        task.start()
 
     def open_details(self) -> None:
         p = self.selected_property()

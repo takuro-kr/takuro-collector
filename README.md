@@ -1,6 +1,6 @@
 # TAKURO Collector
 
-Windows용 임대 매물 수집기입니다. 가져온 배포 기준선은 **0.4.0**, 현재 개발 버전은 **0.4.1**입니다.
+Windows용 임대 매물 수집기입니다. 가져온 배포 기준선은 **0.4.0**, 현재 개발 버전은 **0.4.2**입니다.
 
 ## 개발 환경
 
@@ -41,3 +41,9 @@ git push -u origin main
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/check-repository.ps1
 ```
+
+## 업데이트
+
+설정 → 일반의 `업데이트 정보 URL`에 HTTPS JSON 매니페스트 주소를 저장하면 상단의 `업데이트 확인` 버튼을 사용할 수 있습니다. 프로그램은 새 ZIP을 자동으로 내려받고 SHA-256이 일치할 때만 사용자 데이터 폴더의 `updates` 아래에 보관합니다. 소스 저장소·로그인 토큰·쿠키는 업데이트 파일에 포함하지 않습니다.
+
+매니페스트 형식은 `config/update-manifest.example.json`을 참고하세요. 배포 서버가 연결되기 전에는 다운로드 및 검증까지만 제공하며, 실행 중인 프로그램의 자동 교체와 실패 시 복구 기능은 다음 단계입니다.
