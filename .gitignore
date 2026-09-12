@@ -12,6 +12,8 @@ venv/
 # Builds and packaged executables
 build/
 dist/
+build-*/
+dist-*/
 *.spec.bak
 *.exe
 *.msi
@@ -63,4 +65,3 @@ tests/.tmp_home/
 .DS_Store
 Thumbs.db
 desktop.ini
-
