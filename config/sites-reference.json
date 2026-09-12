@@ -1,0 +1,13 @@
+{
+  "note": "테스트/참고용 상세 URL. 프로그램은 사이트 root/sitemap에서 현재 상세 링크를 찾고, 필요하면 URL 수집에 직접 붙여넣을 수 있습니다.",
+  "sites": [
+    {"code":"AMM","url":"https://www.otoku-chintai.com/line_c1_oc/station_oc242/bknsta_oc242070/%E6%88%90%E5%9F%8E%E3%83%AD%E3%82%A4%E3%83%A4%E3%83%AB%E3%83%9E%E3%83%B3%E3%82%B7%E3%83%A7%E3%83%B3/room107061105.html"},
+    {"code":"SKY","url":"https://www.skyc-chintai.jp/build-7004418/room-38756239.html"},
+    {"code":"GOODCOM","url":"https://www.goodcomasset-gc.co.jp/bkndetail/2673365286/room101312034/"},
+    {"code":"NAM","url":"https://ref.namiki-grp.co.jp/estate/building2327959/room6472696"},
+    {"code":"AMB","url":"https://pm.am-bition.jp/rent/2387/22422"},
+    {"code":"KIN","url":"https://kinoshita-chintai.com/details/13075_76details.html"},
+    {"code":"SYLA","url":"https://rent.syla.jp/line_c1_rs/station_rs2/bknsta_rs2165/SYFORME%20SHINKOYASU/room104008687.html"},
+    {"code":"STAGEPLAN","url":"https://stageplan.es-ws.jp/es/rent/1113666967450000010150"}
+  ]
+}

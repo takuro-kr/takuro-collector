@@ -1,0 +1,66 @@
+# Python / test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Builds and packaged executables
+build/
+dist/
+*.spec.bak
+*.exe
+*.msi
+*.zip
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.local
+*secret*
+*credential*
+*cookie*
+*token*
+auth.json
+storage-state*.json
+
+# TAKURO runtime state (contains credentials, cookies, or collected data)
+collector.db
+collector.db-*
+*.sqlite
+*.sqlite3
+browser_profiles/
+logs/
+properties/
+exports/
+downloads/
+collected/
+data/
+output/
+outputs/
+screenshots/
+traces/
+tests/.tmp_home/
+
+# Collected property/media documents
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.gif
+*.pdf
+*.csv
+*.tsv
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
