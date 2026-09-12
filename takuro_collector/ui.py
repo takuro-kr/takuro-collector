@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 import sys
 import time
 import traceback
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Any, Callable
 
@@ -50,6 +52,45 @@ from .autostart import is_windows_startup_enabled, set_windows_startup
 
 
 from .display import photo_state_label as _photo_state_label, property_status_label as _property_status_label, wp_state_label as _wp_state_label
+
+
+class PropertyTableItem(QTableWidgetItem):
+    """QTableWidget item with a typed key and unknown-last ordering."""
+
+    descending = False
+
+    def __init__(self, text: str = ""):
+        super().__init__(text)
+        self._sort_key: Any = ""
+        self._sort_known = True
+
+    def set_sort_value(self, value: Any, *, known: bool = True) -> None:
+        self._sort_key = value
+        self._sort_known = bool(known)
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, PropertyTableItem):
+            if self._sort_known != other._sort_known:
+                # Qt reverses the comparator for descending order. Flip this
+                # boundary too so unknown values remain at the bottom.
+                if self.descending:
+                    return not self._sort_known
+                return self._sort_known
+            return self._sort_key < other._sort_key
+        return super().__lt__(other)
+
+
+def _text_sort_key(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).casefold()
+
+
+def _room_sort_key(value: Any) -> tuple:
+    text = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", text)
+        if part
+    )
 
 
 def _package_state_label(prop: dict) -> str:
@@ -398,6 +439,8 @@ class MainWindow(QMainWindow):
         self.task: TaskThread | None = None
         self._automatic_run = False
         self._property_refresh_generation = 0
+        self._property_sort_column: int | None = None
+        self._property_sort_order = Qt.AscendingOrder
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1450, 860)
         self._build_ui()
@@ -574,6 +617,8 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
         self.table.doubleClicked.connect(lambda _index: self.open_details())
         header = self.table.horizontalHeader()
+        header.setSortIndicatorShown(False)
+        header.sectionClicked.connect(self.sort_property_table)
         # ResizeToContents repeatedly scans a whole column as rows are inserted and
         # becomes very expensive around 500 rows. Stable widths keep refresh cost
         # linear while the two text-heavy columns continue to use remaining space.
@@ -817,6 +862,42 @@ class MainWindow(QMainWindow):
         pid = item.data(Qt.UserRole)
         return self.db.property(int(pid)) if pid else None
 
+    def _current_property_id(self) -> int | None:
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        value = item.data(Qt.UserRole) if item else None
+        return int(value) if value else None
+
+    def _select_property_id(self, property_id: int | None) -> None:
+        if not property_id:
+            return
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(Qt.UserRole) == property_id:
+                self.table.selectRow(row)
+                return
+
+    def _apply_property_sort(self) -> None:
+        if self._property_sort_column is None:
+            return
+        PropertyTableItem.descending = self._property_sort_order == Qt.DescendingOrder
+        self.table.sortItems(self._property_sort_column, self._property_sort_order)
+
+    def sort_property_table(self, column: int) -> None:
+        selected_pid = self._current_property_id()
+        if self._property_sort_column == column:
+            self._property_sort_order = (
+                Qt.DescendingOrder if self._property_sort_order == Qt.AscendingOrder else Qt.AscendingOrder
+            )
+        else:
+            self._property_sort_column = column
+            self._property_sort_order = Qt.AscendingOrder
+        header = self.table.horizontalHeader()
+        header.setSortIndicatorShown(True)
+        header.setSortIndicator(column, self._property_sort_order)
+        self._apply_property_sort()
+        self._select_property_id(selected_pid)
+
     def refresh_all(self) -> None:
         self.refresh_sites()
         self.refresh_properties()
@@ -847,11 +928,9 @@ class MainWindow(QMainWindow):
         generation = self._property_refresh_generation
         batch_size = max(20, int(batch_size))
 
-        selected_pid = None
-        current = self.table.currentRow()
-        if current >= 0 and self.table.item(current, 0):
-            selected_pid = self.table.item(current, 0).data(Qt.UserRole)
+        selected_pid = self._current_property_id()
 
+        self.table.horizontalHeader().setSectionsClickable(False)
         self.table.blockSignals(True)
         self.table.setRowCount(len(rows))
         self.table.blockSignals(False)
@@ -882,12 +961,32 @@ class MainWindow(QMainWindow):
                         "🟢 완료" if zip_ok else "⚪ 없음",
                         _package_state_label(p),
                     ]
+                    raw_status = str(p.get("status", "new")).strip().lower()
+                    raw_photo = str(p.get("photo_state", "-")).strip().lower()
+                    raw_takuro = str(p.get("wp_package_state") or p.get("wp_sync_state") or "pending").strip().lower()
+                    room_text = str(p.get("room", "")).strip()
+                    rent = int(p.get("rent") or 0)
+                    fee = int(p.get("management_fee") or 0)
+                    sort_values = [
+                        (raw_status, bool(raw_status)),
+                        (_text_sort_key(values[1]), bool(values[1])),
+                        (_text_sort_key(values[2]), bool(values[2])),
+                        (_room_sort_key(room_text), bool(room_text)),
+                        (_text_sort_key(values[4]), bool(values[4])),
+                        (rent, rent > 0),
+                        (fee, fee > 0),
+                        (raw_photo, bool(raw_photo)),
+                        (1 if pdf_ok else 0, True),
+                        (1 if zip_ok else 0, True),
+                        (raw_takuro, bool(raw_takuro)),
+                    ]
                     for c, value in enumerate(values):
                         item = self.table.item(r, c)
-                        if item is None:
-                            item = QTableWidgetItem()
+                        if not isinstance(item, PropertyTableItem):
+                            item = PropertyTableItem()
                             self.table.setItem(r, c, item)
                         item.setText(value)
+                        item.set_sort_value(sort_values[c][0], known=sort_values[c][1])
                         if c == 0:
                             item.setData(Qt.UserRole, int(p["id"]))
                         elif c == 2:
@@ -903,12 +1002,9 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(5, lambda: update_batch(end))
                 return
 
-            if selected_pid:
-                for r in range(self.table.rowCount()):
-                    item = self.table.item(r, 0)
-                    if item and item.data(Qt.UserRole) == selected_pid:
-                        self.table.selectRow(r)
-                        break
+            self._apply_property_sort()
+            self._select_property_id(selected_pid)
+            self.table.horizontalHeader().setSectionsClickable(True)
             self.refresh_copy_panel()
 
         QTimer.singleShot(0, update_batch)
@@ -925,6 +1021,8 @@ class MainWindow(QMainWindow):
         by_id = {int(p["id"]): p for p in rows}
         total = self.table.rowCount()
         batch_size = max(10, int(batch_size))
+        selected_pid = self._current_property_id()
+        self.table.horizontalHeader().setSectionsClickable(False)
 
         def update_batch(start: int = 0) -> None:
             end = min(total, start + batch_size)
@@ -950,17 +1048,29 @@ class MainWindow(QMainWindow):
                         9: "🟢 완료" if zip_ok else "⚪ 없음",
                         10: _package_state_label(p),
                     }
+                    sort_values = {
+                        0: str(p.get("status", "new")).strip().lower(),
+                        7: str(p.get("photo_state", "-")).strip().lower(),
+                        8: 1 if pdf_ok else 0,
+                        9: 1 if zip_ok else 0,
+                        10: str(p.get("wp_package_state") or p.get("wp_sync_state") or "pending").strip().lower(),
+                    }
                     for c, value in values.items():
                         item = self.table.item(r, c)
-                        if item is None:
-                            item = QTableWidgetItem()
+                        if not isinstance(item, PropertyTableItem):
+                            item = PropertyTableItem()
                             self.table.setItem(r, c, item)
                         item.setText(value)
+                        item.set_sort_value(sort_values[c], known=True)
             finally:
                 self.table.setUpdatesEnabled(True)
                 self.table.viewport().update()
             if end < total:
                 QTimer.singleShot(10, lambda: update_batch(end))
+                return
+            self._apply_property_sort()
+            self._select_property_id(selected_pid)
+            self.table.horizontalHeader().setSectionsClickable(True)
 
         QTimer.singleShot(0, update_batch)
 
