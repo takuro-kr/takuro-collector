@@ -15,6 +15,7 @@ dist/
 build-*/
 dist-*/
 *.spec.bak
+TAKURO Updater.spec
 *.exe
 *.msi
 *.zip

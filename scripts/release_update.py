@@ -19,6 +19,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from takuro_collector.updater import EXECUTABLE_NAME, SCHEMA_VERSION, UPDATE_HOST, _safe_member, _signed_payload, _version
 
 
+def _console(value: object) -> None:
+    encoding = sys.stdout.encoding or "utf-8"
+    print(str(value).encode(encoding, errors="backslashreplace").decode(encoding))
+
+
 def _outside_repository(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if resolved == ROOT or ROOT in resolved.parents:
@@ -44,8 +49,8 @@ def generate_key(private_key_path: Path, public_key_path: Path | None) -> None:
     )).decode("ascii")
     if public_key_path:
         public_key_path.expanduser().resolve().write_text(public_b64 + "\n", encoding="ascii")
-    print(f"Private key created outside repository: {private_key_path}")
-    print(f"Public key (safe to embed): {public_b64}")
+    _console(f"Private key created outside repository: {private_key_path}")
+    _console(f"Public key (safe to embed): {public_b64}")
 
 
 def prepare(args) -> tuple[Path, Path]:
@@ -88,8 +93,8 @@ def prepare(args) -> tuple[Path, Path]:
     manifest["signature"] = base64.b64encode(key.sign(_signed_payload(manifest))).decode("ascii")
     latest = output / "latest.json"
     latest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"Upload: {latest}")
-    print(f"Upload: {release_zip}")
+    _console(f"Upload: {latest}")
+    _console(f"Upload: {release_zip}")
     return latest, release_zip
 
 
