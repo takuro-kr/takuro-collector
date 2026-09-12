@@ -15,6 +15,10 @@ from ..models import PropertyCandidate
 from ..utils import ALLOWED_PREFECTURES, canonical_host, normalize_room, source_id_fallback
 
 
+class ListingInactive(RuntimeError):
+    """A listing disappeared after discovery and must be skipped normally."""
+
+
 @dataclass
 class DiscoveryResult:
     urls: list[str]

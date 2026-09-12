@@ -12,6 +12,7 @@ from .wordpress import WordPressSync, WordPressError
 
 logger = get_logger("collector")
 from .sites import adapter_for_url, adapters
+from .sites.base import ListingInactive
 
 ProgressFn = Callable[[str, str, int, int], None]
 
@@ -31,6 +32,7 @@ class ScanResult:
     review_filtered: int = 0
     detail_attempted: int = 0
     inventory_snapshots: int = 0
+    inactive_skipped: int = 0
     messages: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -48,6 +50,7 @@ class ScanResult:
             "review_filtered": self.review_filtered,
             "detail_attempted": self.detail_attempted,
             "inventory_snapshots": self.inventory_snapshots,
+            "inactive_skipped": self.inactive_skipped,
             "messages": self.messages,
         }
 
@@ -184,6 +187,9 @@ class CollectorEngine:
                         result.messages.append(str(e))
                         # One login failure normally applies to the whole site.
                         raise
+                    except ListingInactive as e:
+                        result.inactive_skipped += 1
+                        result.messages.append(f"{adapter.code} {url}: {e}")
                     except ValueError as e:
                         result.skipped_region_or_parse += 1
                         result.messages.append(f"{adapter.code} {url}: {e}")
@@ -241,6 +247,9 @@ class CollectorEngine:
                 result.login_required += 1
                 result.messages.append(str(e))
                 self.db.set_site_status(adapter.code, "login_required", error=str(e))
+            except ListingInactive as e:
+                result.inactive_skipped += 1
+                result.messages.append(f"{adapter.code}: {e}")
             except Exception as e:
                 result.errors += 1
                 result.messages.append(f"{adapter.code}: {e}")

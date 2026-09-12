@@ -1,13 +1,13 @@
 import re
 import unicodedata
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from ..extractor import extract_generic
 from ..models import PropertyCandidate
 from ..utils import canonical_host
-from .base import BaseAdapter
+from .base import BaseAdapter, DiscoveryResult, ListingInactive
 
 
 def _yen(value: str) -> int:
@@ -147,10 +147,56 @@ class AmbitionAdapter(BaseAdapter):
     label = "アンビション"
     domains = ("pm.am-bition.jp",)
     management_company = "アンビション"
-    seed_urls = ("https://pm.am-bition.jp/rent/",)
+    seed_urls = (
+        "https://pm.am-bition.jp/rent_search/%E6%9D%B1%E4%BA%AC%E9%83%BD",
+        "https://pm.am-bition.jp/rent_search/%E5%8D%83%E8%91%89%E7%9C%8C",
+        "https://pm.am-bition.jp/rent_search/%E5%9F%BC%E7%8E%89%E7%9C%8C",
+        "https://pm.am-bition.jp/rent_search/%E7%A5%9E%E5%A5%88%E5%B7%9D%E7%9C%8C",
+    )
     detail_patterns = (r"/rent/\d+/(\d+)(?:$|[/?#])",)
     force_browser = True
     login_expected = True
+
+    def discover(self, fetcher) -> DiscoveryResult:
+        """Walk only AMB's live room tables and their explicit next links."""
+        urls: list[str] = []
+        seen_urls: set[str] = set()
+        seen_pages: set[str] = set()
+        any_browser = False
+        for seed in self.seed_urls:
+            page_url = seed
+            seed_path = unquote(urlparse(seed).path).rstrip("/")
+            while page_url and page_url not in seen_pages:
+                seen_pages.add(page_url)
+                result = fetcher.fetch(page_url, self.code, force_browser=self.force_browser,
+                                       login_expected=self.login_expected)
+                any_browser = any_browser or result.via_browser
+                soup = BeautifulSoup(result.html, "html.parser")
+                for anchor in soup.select(".item_room_table table.check_table a[href]"):
+                    target = urljoin(result.url, str(anchor.get("href") or ""))
+                    identity = _detail_identity(target)
+                    if not identity:
+                        continue
+                    canonical = f"https://pm.am-bition.jp/rent/{identity[0]}/{identity[1]}"
+                    if canonical not in seen_urls:
+                        seen_urls.add(canonical)
+                        urls.append(canonical)
+                next_anchor = soup.select_one("a.next[href]")
+                next_url = urljoin(result.url, str(next_anchor.get("href") or "")) if next_anchor else ""
+                parsed_next = urlparse(next_url)
+                next_path = unquote(parsed_next.path).rstrip("/")
+                if ((parsed_next.hostname or "").lower() != "pm.am-bition.jp"
+                        or not re.fullmatch(rf"{re.escape(seed_path)}(?:/page:\d+)?", next_path)):
+                    next_url = ""
+                page_url = next_url
+        return DiscoveryResult(urls, any_browser, listed_count=len(urls))
+
+    @staticmethod
+    def _is_inactive_detail(status_code: int, html: str) -> bool:
+        if status_code == 404:
+            return True
+        text = BeautifulSoup(html or "", "html.parser").get_text(" ", strip=True)
+        return "404 ERROR PAGE NOT FOUND" in text and "ページが見つかりませんでした" in text
 
     def collect_url(self, fetcher, url: str) -> PropertyCandidate:
         detail = fetcher.fetch(
@@ -159,6 +205,8 @@ class AmbitionAdapter(BaseAdapter):
             force_browser=self.force_browser,
             login_expected=self.login_expected,
         )
+        if self._is_inactive_detail(detail.status_code, detail.html):
+            raise ListingInactive("AMB 삭제/비공개 매물")
         candidate = self.parse(detail.html, detail.url)
         identity = _detail_identity(detail.url)
         parent_url = _parent_building_url(detail.url)
