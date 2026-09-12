@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 import time
 import traceback
 import unicodedata
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal
@@ -1128,7 +1130,7 @@ class MainWindow(QMainWindow):
         if self.task and self.task.isRunning():
             QMessageBox.information(self, "업데이트 확인", "다른 작업이 끝난 뒤 다시 시도해 주세요.")
             return
-        from .updater import check, download
+        from .updater import check, download, launch_helper, stage
 
         self.update_btn.setEnabled(False)
         self.status.setText("업데이트 확인 중…")
@@ -1137,25 +1139,52 @@ class MainWindow(QMainWindow):
             info = check(manifest_url, __version__)
             if info is None:
                 return {"current": True}
-            path = download(info)
-            return {"current": False, "version": info.version, "notes": info.notes, "path": str(path)}
+            return {"current": False, "info": info}
 
         task = TaskThread(job, self)
         self.task = task
 
         def finish(result):
-            self.update_btn.setEnabled(True)
             self.task = None
             if result.get("current"):
+                self.update_btn.setEnabled(True)
                 self.status.setText("최신 버전입니다.")
                 QMessageBox.information(self, "업데이트 확인", f"현재 v{__version__}가 최신 버전입니다.")
                 return
-            self.status.setText(f"v{result['version']} 업데이트 검증 완료")
-            answer = QMessageBox.information(
+            info = result["info"]
+            notes = "\n".join(f"• {note}" for note in info.notes)
+            answer = QMessageBox.question(
                 self,
-                "업데이트 다운로드 완료",
-                f"v{result['version']} 파일을 SHA-256 검증했습니다.\n\n{result.get('notes','')}\n\n저장 위치:\n{result['path']}",
+                "업데이트 발견",
+                f"v{info.version} 업데이트가 있습니다.\n\n현재 버전: v{__version__}\n새 버전: v{info.version}"
+                + (f"\n\n{notes}" if notes else "") + "\n\n업데이트하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
             )
+            if answer != QMessageBox.Yes:
+                self.update_btn.setEnabled(True)
+                self.status.setText("업데이트가 취소되었습니다.")
+                return
+
+            self.status.setText("업데이트 다운로드 및 검증 중…")
+
+            def install_job(_progress):
+                archive = download(info)
+                package = stage(info, archive)
+                launch_helper(info, package)
+                return {"version": info.version}
+
+            install_task = TaskThread(install_job, self)
+            self.task = install_task
+
+            def install_ready(value):
+                self.task = None
+                self.status.setText(f"v{value['version']} 설치를 위해 다시 시작합니다…")
+                QTimer.singleShot(100, QApplication.quit)
+
+            install_task.result.connect(install_ready)
+            install_task.failed.connect(fail)
+            install_task.start()
 
         def fail(message):
             self.update_btn.setEnabled(True)
@@ -1436,4 +1465,11 @@ def run_app() -> int:
     app.setOrganizationName("TAKURO TECHNOLOGY")
     window = MainWindow()
     window.show()
+    marker = os.environ.pop("TAKURO_UPDATE_HEALTH_MARKER", "")
+    token = os.environ.pop("TAKURO_UPDATE_HEALTH_TOKEN", "")
+    if marker and token:
+        try:
+            Path(marker).write_text(token, encoding="utf-8")
+        except OSError:
+            pass
     return app.exec()

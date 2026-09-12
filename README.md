@@ -46,6 +46,6 @@ powershell -ExecutionPolicy Bypass -File scripts/check-repository.ps1
 
 ## 업데이트
 
-설정 → 일반의 `업데이트 정보 URL`에 HTTPS JSON 매니페스트 주소를 저장하면 상단의 `업데이트 확인` 버튼을 사용할 수 있습니다. 프로그램은 새 ZIP을 자동으로 내려받고 SHA-256이 일치할 때만 사용자 데이터 폴더의 `updates` 아래에 보관합니다. 소스 저장소·로그인 토큰·쿠키는 업데이트 파일에 포함하지 않습니다.
+설정 → 일반의 `업데이트 정보 URL`에 HTTPS JSON 매니페스트 주소를 저장하면 상단의 `업데이트 확인` 버튼을 사용할 수 있습니다. 사용자가 승인한 경우에만 서명과 SHA-256을 검증하고, 별도 helper가 프로그램 폴더를 교체한 뒤 health marker를 확인합니다. 시작 확인에 실패하면 known-good 백업으로 복구합니다. 사용자 DB·설정·브라우저 프로필·수집 자료는 프로그램 폴더 밖에 유지됩니다.
 
-매니페스트 형식은 `config/update-manifest.example.json`을 참고하세요. 배포 서버가 연결되기 전에는 다운로드 및 검증까지만 제공하며, 실행 중인 프로그램의 자동 교체와 실패 시 복구 기능은 다음 단계입니다.
+매니페스트 형식은 `config/update-manifest.example.json`을 참고하세요. 운영 HTTPS 호스팅과 Ed25519 공개키를 확정하기 전에는 실제 release를 게시하지 않습니다. signing private key는 저장소나 배포 파일에 포함하지 않습니다.

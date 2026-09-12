@@ -1,6 +1,10 @@
 {
-  "version": "0.4.2",
-  "url": "https://updates.example.com/TAKURO-Collector-0.4.2-Portable-Windows.zip",
+  "schema_version": 1,
+  "version": "0.4.5",
+  "published_at": "2026-09-12T00:00:00+09:00",
+  "download_url": "https://updates.example.com/TAKURO-Collector-0.4.5-Windows.zip",
   "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "notes": "변경 내용을 여기에 기록합니다."
+  "size": 123456789,
+  "release_notes": ["AMM 수집 지원", "수집 매물 목록 정렬 지원"],
+  "signature": "Ed25519 canonical-JSON signature in Base64"
 }
