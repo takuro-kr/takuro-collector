@@ -226,4 +226,8 @@ def launch_helper(info: UpdateInfo, package: Path) -> None:
         "install_dir": str(install_dir), "staged_dir": str(package.resolve()),
         "data_root": str(data_root().resolve()), "marker": str(marker), "token": token,
         "executable": EXECUTABLE_NAME}), encoding="utf-8")
-    subprocess.Popen([str(helper_copy), str(command_path)], close_fds=True)
+    subprocess.Popen(
+        [str(helper_copy), str(command_path)],
+        close_fds=True,
+        cwd=str(helper_dir.resolve()),
+    )

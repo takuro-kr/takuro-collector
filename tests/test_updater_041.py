@@ -9,6 +9,7 @@ import pytest
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from takuro_collector import updater, updater_helper
 from scripts import release_update
@@ -195,6 +196,37 @@ def test_helper_rejects_duplicate_install(tmp_path):
     command, _install, user, _marker = install_fixture(tmp_path)
     (user / "updates").mkdir(); (user / "updates" / "install.lock").write_text("locked")
     with pytest.raises(FileExistsError): updater_helper.install(command, timeout=.01, wait_exit=lambda *_: True)
+
+
+def test_launch_helper_uses_external_absolute_working_directory(tmp_path, monkeypatch):
+    install = tmp_path / "portable path" / "TAKURO Collector"
+    install.mkdir(parents=True)
+    executable = install / "TAKURO Collector.exe"
+    executable.write_bytes(b"collector")
+    (install / "TAKURO Updater.exe").write_bytes(b"helper")
+    staged = tmp_path / "staging path" / "package"
+    staged.mkdir(parents=True)
+    user = tmp_path / "local data"
+    calls = []
+
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater.sys, "executable", str(executable))
+    monkeypatch.setattr(updater, "data_root", lambda: user)
+    monkeypatch.setattr(updater.subprocess, "Popen", lambda args, **kwargs: calls.append((args, kwargs)))
+
+    previous_cwd = os.getcwd()
+    os.chdir(install)
+    try:
+        updater.launch_helper(updater.UpdateInfo("0.4.9", "https://updates.takuro.tech/app.zip", "a" * 64, 1), staged)
+    finally:
+        os.chdir(previous_cwd)
+
+    args, kwargs = calls[0]
+    helper_dir = (user / "updates" / "helper").resolve()
+    assert Path(args[0]).is_absolute()
+    assert Path(args[1]).is_absolute()
+    assert Path(kwargs["cwd"]) == helper_dir
+    assert helper_dir != install.resolve()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process handle regression")
