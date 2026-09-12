@@ -143,6 +143,10 @@ class BaseAdapter:
             source_property_id=source_id,
             source_id_kind=source_id_kind,
         )
+        return self.candidate_from_data(data, url)
+
+    def candidate_from_data(self, data: dict, url: str) -> PropertyCandidate:
+        source_id, source_id_kind = self.source_id(url)
         building = str(data.get("building_name") or "").strip()
         room = normalize_room(str(data.get("room") or ""))
         address = str(data.get("address") or "").strip()

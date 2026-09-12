@@ -278,21 +278,9 @@ class WordPressSync:
 
     @staticmethod
     def payload_from_row(row: dict) -> dict:
-        # Candidate intake only needs the indexed identity/summary fields.  Keep
-        # the rich Collector payload locally for TXT/ZIP generation instead of
-        # shipping table_fields/photo metadata through a WAF on every sync.
-        return {
-            "source_site": str(row.get("source_site") or "")[:300],
-            "source_property_id": str(row.get("source_property_id") or "")[:300],
-            "management_company": str(row.get("management_company") or "")[:300],
-            "building_name": str(row.get("building_name") or "")[:1000],
-            "room": str(row.get("room") or "")[:300],
-            "prefecture": str(row.get("prefecture") or "")[:100],
-            "address": str(row.get("address") or "")[:1000],
-            "rent": int(row.get("rent") or 0),
-            "management_fee": int(row.get("management_fee") or 0),
-            "source_url": str(row.get("source_url") or "")[:2000],
-        }
+        from .required_listing import homepage_payload
+
+        return homepage_payload(row)
 
     def sync_pending(
         self,

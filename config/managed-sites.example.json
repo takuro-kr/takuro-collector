@@ -1,0 +1,34 @@
+{
+  "sites": [
+    {
+      "enabled": true,
+      "code": "NEWCO",
+      "label": "새 관리회사",
+      "management_company": "관리회사 공식명",
+      "domains": ["rent.example.jp"],
+      "seed_urls": ["https://rent.example.jp/search"],
+      "detail_patterns": ["/rooms/(\\d+)"],
+      "force_browser": false,
+      "login_expected": false,
+      "selectors": {
+        "building_name": "h1.property-name",
+        "room": ".room-number",
+        "address": ".property-address",
+        "rent": ".rent",
+        "management_fee": ".management-fee",
+        "deposit": ".deposit",
+        "key_money": ".key-money",
+        "layout": ".layout",
+        "area": ".area",
+        "built_date": ".built-date",
+        "floor": ".floor",
+        "total_floors": ".total-floors",
+        "orientation": ".orientation",
+        "move_in_date": ".move-in-date",
+        "structure": ".structure",
+        "transport": ".transport li",
+        "equipment": ".equipment li"
+      }
+    }
+  ]
+}

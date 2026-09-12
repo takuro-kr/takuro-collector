@@ -41,7 +41,7 @@ from .collector import CollectorEngine
 from .db import Database
 from .fetcher import Fetcher, open_login_browser
 from .package import attach_pdf, create_zip
-from .paths import database_path, export_root, log_dir
+from .paths import data_root, database_path, export_root, log_dir
 from .photos import PhotoManager
 from .sites import adapters
 from .utils import display_address_to_chome, open_path, open_url
@@ -293,6 +293,9 @@ class SettingsDialog(QDialog):
         sites_tab = QWidget()
         sites_layout = QVBoxLayout(sites_tab)
         sites_layout.addWidget(QLabel("[수집 시작]에서 검색할 사이트를 선택하세요. 특정 매물 URL은 비활성 사이트라도 [URL 수집]으로 직접 수집할 수 있습니다."))
+        self.import_sites_button = QPushButton("관리회사 설정 파일 가져오기")
+        self.import_sites_button.clicked.connect(self._import_managed_sites)
+        sites_layout.addWidget(self.import_sites_button)
         self.site_checks: dict[str, QCheckBox] = {}
         for adapter in adapters():
             chk = QCheckBox(f"{adapter.code} · {adapter.label} · {', '.join(adapter.domains)}")
@@ -307,6 +310,30 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
+
+    def _import_managed_sites(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "관리회사 설정 파일", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            import json
+            from pathlib import Path
+            from .sites.configured import ConfiguredAdapter
+
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            specs = payload.get("sites") if isinstance(payload, dict) else None
+            if not isinstance(specs, list) or not specs:
+                raise ValueError("sites 목록이 비어 있습니다.")
+            configured = [ConfiguredAdapter(spec) for spec in specs if spec.get("enabled", True)]
+            built_in_codes = {adapter.code for adapter in adapters() if adapter.__class__.__name__ != "ConfiguredAdapter"}
+            duplicates = sorted({adapter.code for adapter in configured} & built_in_codes)
+            if duplicates:
+                raise ValueError("내장 관리회사 코드는 덮어쓸 수 없습니다: " + ", ".join(duplicates))
+            target = data_root() / "managed-sites.json"
+            target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            QMessageBox.information(self, "관리회사 설정", f"{len(configured)}개 관리회사 설정을 가져왔습니다. 다음 수집부터 적용됩니다.")
+        except Exception as exc:
+            QMessageBox.warning(self, "관리회사 설정 오류", str(exc))
 
     def _test_wp(self) -> None:
         if self._test_task and self._test_task.isRunning():

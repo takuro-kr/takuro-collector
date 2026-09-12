@@ -37,27 +37,6 @@ class PropertyCandidate:
         return asdict(self)
 
     def wp_payload(self) -> dict[str, Any]:
-        return {
-            "source_site": self.source_site,
-            "source_property_id": self.source_property_id,
-            "management_company": self.management_company,
-            "building_name": self.building_name,
-            "room": self.room,
-            "prefecture": self.prefecture,
-            "address": self.address,
-            "rent": int(self.rent or 0),
-            "management_fee": int(self.management_fee or 0),
-            "source_url": self.source_url,
-            "deposit": self.deposit,
-            "key_money": self.key_money,
-            "area": self.area,
-            "layout": self.layout,
-            "built_date": self.built_date,
-            "floor": self.floor,
-            "total_floors": self.total_floors,
-            "structure": self.structure,
-            "orientation": self.orientation,
-            "move_in_date": self.move_in_date,
-            "transport": self.transport,
-            "equipment": self.equipment,
-        }
+        from .required_listing import homepage_payload
+
+        return homepage_payload(self.to_dict())
