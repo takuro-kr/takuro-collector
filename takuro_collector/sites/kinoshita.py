@@ -349,7 +349,10 @@ class KinoshitaAdapter(BaseAdapter):
         # Dedicated fields first.
         raw = pair_value(pairs, ("部屋番号", "号室", "室番号", "お部屋番号", "ROOM"), contains=False)
         raw = cls._nfkc(raw)
-        m = re.search(r"([0-9]{1,5}[A-Za-z]?)\s*(?:号室|室)?$", raw)
+        # KIN also uses letter-only unit labels (for example A号室/F号室).
+        # Accept only an explicit dedicated field or an explicit 号室 suffix;
+        # never derive a unit from the numeric source URL.
+        m = re.search(r"([0-9A-Za-z]{1,6})\s*(?:号室|室)?$", raw)
         if m:
             return normalize_room(m.group(1))
 
@@ -362,11 +365,11 @@ class KinoshitaAdapter(BaseAdapter):
         strings.append(building)
         for text in strings:
             text = cls._nfkc(text)
-            m = re.search(r"(?:^|\s|[-_/])([0-9]{1,5}[A-Za-z]?)\s*号室(?:\s|$)", text)
+            m = re.search(r"(?:^|\s|[-_/])([0-9A-Za-z]{1,6})\s*号室(?:\s|$)", text)
             if m:
                 return normalize_room(m.group(1))
         fallback = cls._nfkc(fallback)
-        if re.fullmatch(r"[0-9]{1,5}[A-Za-z]?", fallback):
+        if re.fullmatch(r"[0-9A-Za-z]{1,6}", fallback):
             return normalize_room(fallback)
         return ""
 
@@ -928,7 +931,7 @@ class KinoshitaAdapter(BaseAdapter):
 
         building = clean_text(str(data.get("building_name") or ""))
         # Remove a trailing room from a KIN heading/title even if generic extraction missed the room.
-        building = re.sub(r"\s+[0-9０-９]{1,5}[A-Za-z]?\s*号室.*$", "", building).strip()
+        building = re.sub(r"\s+[0-9０-９A-Za-z]{1,6}\s*号室.*$", "", building).strip()
         table_fields = self._table_fields(soup)
         structured_pairs = pairs.copy()
         for key, values in table_fields.items():

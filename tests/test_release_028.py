@@ -334,15 +334,20 @@ def test_kin_inventory_rejects_duplicate_pagination_page_even_when_counts_add_up
     assert result.inventory_complete is False
 
 
-def test_kin_room_parser_12318_1_four_cell_second_pair_fixture():
+def test_kin_room_parser_12318_1_letter_only_room_fixture():
     html = (FIX / 'kin_detail_12318_1_room_structure.html').read_text(encoding='utf-8')
     soup = __import__('bs4').BeautifulSoup(html, 'html.parser')
     pairs = KinoshitaAdapter._table_fields(soup)
-    assert KinoshitaAdapter._room(soup, pairs, 'テスト物件', '') == '203'
+    assert KinoshitaAdapter._room(soup, pairs, '弥生台キャッスル', '') == 'A'
 
 
-def test_kin_room_parser_11983_4_four_cell_second_pair_fixture():
+def test_kin_room_parser_11983_4_letter_only_room_fixture():
     html = (FIX / 'kin_detail_11983_4_room_structure.html').read_text(encoding='utf-8')
     soup = __import__('bs4').BeautifulSoup(html, 'html.parser')
     pairs = KinoshitaAdapter._table_fields(soup)
-    assert KinoshitaAdapter._room(soup, pairs, '別テスト物件', '') == '105'
+    assert KinoshitaAdapter._room(soup, pairs, 'ワイズスクエア', '') == 'F'
+
+
+def test_kin_letter_only_room_requires_explicit_dom_evidence():
+    soup = __import__('bs4').BeautifulSoup('<html><h1>物件名</h1></html>', 'html.parser')
+    assert KinoshitaAdapter._room(soup, {}, '物件名', '') == ''
