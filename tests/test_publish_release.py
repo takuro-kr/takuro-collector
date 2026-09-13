@@ -147,16 +147,16 @@ def test_https_failure_rolls_back_latest_and_skips_retention(tmp_path, monkeypat
     assert all(op[0] != "rmd" for op in ftp.operations)
 
 
-def test_retention_keeps_latest_and_two_previous_and_ignores_other_dirs():
+def test_retention_keeps_latest_and_previous_and_ignores_other_dirs():
     ftp = FakeFTP(); versions = ["0.4.8", "0.4.9", "0.4.10", "0.4.11", "error"]
     for version in versions:
         ftp.dirs.add(f"/releases/{version}")
         if publisher.SEMVER.fullmatch(version):
             ftp.files[f"/releases/{version}/TAKURO-Collector-{version}.zip"] = b"zip"
     removed = publisher.cleanup_releases(ftp)
-    assert removed == ["0.4.8"]
+    assert removed == ["0.4.9", "0.4.8"]
     assert "/releases/error" in ftp.dirs
-    assert all(f"/releases/{v}" in ftp.dirs for v in ("0.4.11", "0.4.10", "0.4.9"))
+    assert all(f"/releases/{v}" in ftp.dirs for v in ("0.4.11", "0.4.10"))
 
 
 def test_dry_run_performs_no_credential_or_server_action(tmp_path, monkeypatch, capsys):

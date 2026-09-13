@@ -66,5 +66,5 @@ cmdkey /generic:"TAKURO Collector Release Publisher" `
 Publisher는 로컬 manifest 서명과 ZIP SHA-256/package version을 먼저 검증합니다.
 ZIP은 `.uploading`으로 올려 재다운로드 검증 후 rename하고, manifest는 임시
 파일 검증 후 `latest.json`을 백업·교체합니다. HTTPS 비캐시/일반 URL 검증이
-모두 끝난 후에만 `/releases`의 엄격한 semantic-version 폴더 중 최신 3개를
+모두 끝난 후에만 `/releases`의 엄격한 semantic-version 폴더 중 최신 2개를
 제외한 구버전을 정리합니다.

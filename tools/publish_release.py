@@ -211,7 +211,7 @@ def _safe_rmtree_release(ftp: ftplib.FTP_TLS, version: str) -> None:
     ftp.rmd(directory)
 
 
-def cleanup_releases(ftp: ftplib.FTP_TLS, keep: int = 3) -> list[str]:
+def cleanup_releases(ftp: ftplib.FTP_TLS, keep: int = 2) -> list[str]:
     versions = []
     for name, facts in ftp.mlsd("/releases"):
         if facts.get("type") == "dir" and SEMVER.fullmatch(name):
@@ -296,7 +296,7 @@ def publish(release: LocalRelease, ftp: ftplib.FTP_TLS,
     if backed_up:
         ftp.delete(previous)
     _console("[retention] 성공 후 오래된 semantic version release 정리")
-    return cleanup_releases(ftp, keep=3)
+    return cleanup_releases(ftp, keep=2)
 
 
 def build_parser() -> argparse.ArgumentParser:
