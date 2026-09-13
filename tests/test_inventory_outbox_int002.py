@@ -14,7 +14,12 @@ from takuro_collector.db import Database, SCHEMA_VERSION
 from takuro_collector.models import PropertyCandidate
 from takuro_collector.sites.base import DiscoveryResult
 from takuro_collector.ui import MainWindow
-from takuro_collector.wordpress import WordPressClient, WordPressError, WordPressSync
+from takuro_collector.wordpress import (
+    INVENTORY_DELIVERY_MODE,
+    WordPressClient,
+    WordPressError,
+    WordPressSync,
+)
 
 
 def item(source_id: str) -> dict:
@@ -220,7 +225,7 @@ def test_same_site_fifo_and_other_site_continue_after_retryable_failure(tmp_path
                 raise WordPressError("HTTP 503: retry")
             return accepted(kwargs)
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     out = sync.sync_inventory_snapshots()
     assert calls == [k1["run_id"], a1["run_id"]]
@@ -246,7 +251,7 @@ def test_terminal_rejection_does_not_block_next_same_site_run(tmp_path, monkeypa
                             "code": "RUN_ID_PAYLOAD_CONFLICT", "message": "conflict", "retryable": False}}
             return accepted(kwargs)
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     sync.sync_inventory_snapshots()
     assert calls == [first["run_id"], second["run_id"]]
@@ -268,7 +273,7 @@ def test_retryable_http_failure_keeps_same_run(tmp_path, monkeypatch, status):
                 raise WordPressError(f"HTTP {status}: temporary")
             return accepted(kwargs, duplicate=True)
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     first = sync.sync_inventory_snapshots()
     second = sync.sync_inventory_snapshots()
@@ -294,7 +299,7 @@ def test_structured_rejection_state(tmp_path, monkeypatch, retryable, expected):
                 },
             }
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     sync.sync_inventory_snapshots()
     row = db.inventory_outbox_rows()[0]
@@ -325,7 +330,7 @@ def test_invalid_success_response_remains_retryable(tmp_path, monkeypatch, mutat
             mutate(reply)
             return reply
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     out = sync.sync_inventory_snapshots()
     row = db.inventory_outbox_rows()[0]
@@ -343,7 +348,7 @@ def test_duplicate_run_is_idempotent_success(tmp_path, monkeypatch):
         def send_inventory_run(self, **kwargs):
             return accepted(kwargs, duplicate=True)
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: Client())
     out = sync.sync_inventory_snapshots()
     assert out["synced_snapshots"] == 1
@@ -402,7 +407,7 @@ def test_local_registration_endpoint_delivery_e2e(tmp_path, monkeypatch):
     client = WordPressClient("https://registration.local", "a" * 64)
     session = Session()
     client.session = session
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="registration_v2")
     monkeypatch.setattr(sync, "client", lambda: client)
     result = sync.sync_inventory_snapshots()
     assert result["synced_snapshots"] == 1
@@ -411,6 +416,61 @@ def test_local_registration_endpoint_delivery_e2e(tmp_path, monkeypatch):
     assert url == "https://registration.local/wp-json/takuro-registration/v1/inventory-snapshots"
     assert request["json"]["run_id"] == run["run_id"]
     assert request["json"]["source_property_ids"] == ["1", "2"]
+    db.close()
+
+
+def test_default_rollout_routes_outbox_to_legacy_connect_only(tmp_path, monkeypatch):
+    db = Database(tmp_path / "db.sqlite3")
+    run = db.save_inventory_snapshot("KIN", "kin.example", [item("one")])
+    calls = {"legacy": [], "registration": []}
+
+    class Client:
+        def send_inventory_snapshot(self, **kwargs):
+            calls["legacy"].append(kwargs)
+            return {"accepted": True, "transport": "rest_json"}
+
+        def send_inventory_run(self, **kwargs):
+            calls["registration"].append(kwargs)
+            raise AssertionError("default rollout must not call Registration inventory")
+
+    assert INVENTORY_DELIVERY_MODE == "legacy_connect"
+    sync = WordPressSync(db)
+    monkeypatch.setattr(sync, "client", lambda: Client())
+    result = sync.sync_inventory_snapshots()
+    assert len(calls["legacy"]) == 1
+    assert calls["registration"] == []
+    assert set(calls["legacy"][0]) == {
+        "source_site", "source_property_ids", "complete", "errors", "parse_errors", "blockers"
+    }
+    assert result["synced_snapshots"] == 1
+    assert result["results"][0]["destination"] == "legacy_connect"
+    assert db.inventory_outbox_rows()[0]["run_id"] == run["run_id"]
+    assert db.inventory_outbox_rows()[0]["delivery_status"] == "accepted"
+    db.close()
+
+
+@pytest.mark.parametrize("accepted", [False, "true", 1, None])
+def test_legacy_connect_requires_boolean_true_and_keeps_retryable(tmp_path, monkeypatch, accepted):
+    db = Database(tmp_path / "db.sqlite3")
+    run = db.save_inventory_snapshot("KIN", "kin.example", [item("one")])
+    calls = []
+
+    class Client:
+        def send_inventory_snapshot(self, **kwargs):
+            calls.append(kwargs)
+            return {"accepted": accepted, "transport": "rest_json"}
+
+        def send_inventory_run(self, **kwargs):
+            raise AssertionError("dual-write")
+
+    sync = WordPressSync(db)
+    monkeypatch.setattr(sync, "client", lambda: Client())
+    result = sync.sync_inventory_snapshots()
+    row = db.inventory_outbox_rows()[0]
+    assert len(calls) == 1
+    assert row["run_id"] == run["run_id"]
+    assert row["delivery_status"] == "retryable_error"
+    assert result["synced_snapshots"] == 0
     db.close()
 
 

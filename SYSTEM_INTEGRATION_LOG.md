@@ -148,3 +148,29 @@ Collector와 Registration V2 0.7.10을 함께 운영 배포하기 전에 동일 
 
 Status:\
 Collector 코드·로컬 endpoint E2E·전체 회귀 완료 / Registration V2 0.7.10과 동시 운영 배포 대기
+
+## 2026-09-14 - Collector INT-002 legacy Connect 안전 롤아웃
+
+Component:\
+TAKURO Collector 0.4.20
+
+Change:\
+append-only inventory outbox와 FIFO/retry 구조는 활성화하되 v0.4.20의 기본 inventory delivery destination을 `legacy_connect`로 고정했다. Registration V2 inventory client는 향후 전환용 dormant 코드로 유지한다.
+
+Reason:\
+Registration V2 0.7.10의 운영 검증은 완료됐지만 authoritative lifecycle writer 전환은 별도 총괄 승인이 필요하므로, 최초 outbox 배포에서 Connect와 Registration의 dual-write를 방지하기 위해서다.
+
+Interface/Data Changes:\
+기본 운영 request는 기존 `POST /wp-json/takuro/v1/collection/inventory-snapshot`과 기존 필드 `source_site`, `complete`, `errors`, `parse_errors`, `blockers`, `source_property_ids`만 사용한다. `run_id`, `completed_at`, checksum은 Collector outbox 내부에 보존하지만 legacy request에는 추가하지 않는다. 신규 `POST /wp-json/takuro-registration/v1/inventory-snapshots` client는 삭제하지 않았으며 기본 일반 동기화에서는 호출하지 않는다. 한 run에는 선택된 endpoint 하나만 사용하고 자동 fallback하지 않는다.
+
+Affected Components:\
+TAKURO Connect가 v0.4.20 운영 inventory의 유일한 destination이다. Registration V2 lifecycle/current/events는 일반 Collector 동기화로 변경되지 않는다. Import V2와 Property Search는 변경하지 않았다.
+
+Compatibility:\
+legacy Connect request/response shape를 유지하므로 기존 운영 endpoint와 호환된다. DB v6 outbox, same-site FIFO, restart recovery, candidate 실패 안전성은 그대로 활성화된다.
+
+Required Follow-up:\
+Registration V2를 authoritative inventory destination으로 전환하려면 총괄 승인 후 `registration_v2` mode로 단일 전환하고 Connect writer 중단 및 rollback 순서를 함께 검증해야 한다. dual-write는 허용하지 않는다.
+
+Status:\
+legacy Connect only 로컬 E2E 및 전체 회귀 완료 / v0.4.20 운영 배포 준비

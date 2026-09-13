@@ -19,6 +19,11 @@ from .utils import canonical_host
 
 logger = get_logger("wordpress")
 
+# INT-002 staged rollout: durable outbox is active, but lifecycle authority
+# remains on the legacy Connect endpoint until a separate architecture approval.
+INVENTORY_DELIVERY_MODE = "legacy_connect"
+INVENTORY_DELIVERY_MODES = {"legacy_connect", "registration_v2"}
+
 
 class WordPressError(RuntimeError):
     pass
@@ -300,8 +305,11 @@ class WordPressClient:
 
 
 class WordPressSync:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, *, inventory_delivery_mode: str = INVENTORY_DELIVERY_MODE):
         self.db = db
+        if inventory_delivery_mode not in INVENTORY_DELIVERY_MODES:
+            raise ValueError(f"지원하지 않는 inventory delivery mode: {inventory_delivery_mode}")
+        self.inventory_delivery_mode = inventory_delivery_mode
 
     def configured(self) -> bool:
         return self.db.get_bool("wp_enabled", False) and bool(self.db.get_setting("wp_site_url", "")) and bool(self.key())
@@ -563,18 +571,48 @@ class WordPressSync:
             if progress_callback:
                 progress_callback(0, expected, f"{site_code} inventory run 전송 준비 · {expected}건 · {run_id[:8]}")
             self.db.mark_inventory_run(run_id, state="sending")
+            endpoint_label = (
+                "connect/collection/inventory-snapshot"
+                if self.inventory_delivery_mode == "legacy_connect"
+                else "registration/inventory-snapshots"
+            )
             try:
-                reply = client.send_inventory_run(
-                    run_id=run_id,
-                    completed_at=completed_at,
-                    source_site=source_site,
-                    source_property_ids=ids,
-                )
+                if self.inventory_delivery_mode == "legacy_connect":
+                    reply = client.send_inventory_snapshot(
+                        source_site=source_site,
+                        source_property_ids=ids,
+                        complete=True,
+                        errors=0,
+                        parse_errors=0,
+                        blockers=[],
+                    )
+                else:
+                    reply = client.send_inventory_run(
+                        run_id=run_id,
+                        completed_at=completed_at,
+                        source_site=source_site,
+                        source_property_ids=ids,
+                    )
                 transport = str(reply.get("transport") or "unknown")
                 transports[transport] = transports.get(transport, 0) + 1
                 accepted = reply.get("accepted")
                 if type(accepted) is not bool:
                     raise WordPressError("inventory 응답 accepted가 boolean이 아닙니다.")
+                if self.inventory_delivery_mode == "legacy_connect":
+                    if not accepted:
+                        raise WordPressError("legacy Connect inventory 승인 응답이 없습니다.")
+                    self.db.mark_inventory_run(run_id, state="accepted", error="")
+                    synced += 1
+                    results.append({
+                        "site_code": site_code,
+                        "run_id": run_id,
+                        "ok": True,
+                        "expected_count": expected,
+                        "destination": "legacy_connect",
+                    })
+                    if progress_callback:
+                        progress_callback(expected, expected, f"{site_code} inventory {expected}/{expected} 승인 완료 · {transport}")
+                    continue
                 if not accepted:
                     reason = reply.get("rejected_reason")
                     if not isinstance(reason, dict) or type(reason.get("retryable")) is not bool:
@@ -588,8 +626,8 @@ class WordPressSync:
                         rejected_code=code, rejected_message=message,
                     )
                     logger.warning(
-                        "inventory delivery rejected site=%s run_id=%s endpoint=registration/inventory-snapshots code=%s message=%s",
-                        site_code, run_id, code, message,
+                        "inventory delivery rejected site=%s run_id=%s endpoint=%s code=%s message=%s",
+                        site_code, run_id, endpoint_label, code, message,
                     )
                     results.append({
                         "site_code": site_code, "run_id": run_id, "ok": False,
@@ -638,8 +676,8 @@ class WordPressSync:
                     rejected_code=code, rejected_message=message,
                 )
                 logger.warning(
-                    "inventory delivery failed site=%s run_id=%s endpoint=registration/inventory-snapshots code=%s message=%s",
-                    site_code, run_id, code, message,
+                    "inventory delivery failed site=%s run_id=%s endpoint=%s code=%s message=%s",
+                    site_code, run_id, endpoint_label, code, message,
                 )
                 results.append({
                     "site_code": site_code, "run_id": run_id, "ok": False,
