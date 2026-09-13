@@ -16,6 +16,12 @@ from takuro_collector import updater, updater_helper
 from scripts import release_update
 
 
+@pytest.fixture(autouse=True)
+def isolated_update_diagnostics(tmp_path, monkeypatch):
+    import takuro_collector.update_diagnostics as diagnostics
+    monkeypatch.setattr(diagnostics, "data_root", lambda: tmp_path / "diagnostics")
+
+
 class Response:
     ok, status_code = True, 200
     def __init__(self, payload=None, content=b""): self.payload, self.content = payload, content
@@ -212,7 +218,7 @@ def test_helper_rolls_back_when_new_version_does_not_start(tmp_path):
     def launch(args, **_kwargs): calls.append(args); return Process(succeeds=False)
     assert updater_helper.install(command, launch=launch, timeout=.05, wait_exit=lambda *_: True) == "rolled_back"
     assert (install / "TAKURO Collector.exe").read_bytes() == b"old"
-    assert json.loads((user / "updates" / "state.json").read_text())["state"] == "rolled_back"
+    assert json.loads((user / "updates" / "state.json").read_text(encoding="utf-8"))["state"] == "rolled_back"
     assert len(calls) == 2
 
 

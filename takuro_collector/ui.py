@@ -518,6 +518,32 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.showMinimized)
         else:
             QTimer.singleShot(0, lambda: _fit_window_to_screen(self))
+        QTimer.singleShot(300, self.show_last_update_result)
+
+    def show_last_update_result(self) -> None:
+        from .update_diagnostics import mark_shown, read_state
+
+        state = read_state()
+        status = str(state.get("status") or "")
+        if status not in {"failed", "rolled_back"} or bool(state.get("shown")):
+            return
+        phase = str(state.get("phase") or "unknown")
+        error = str(state.get("error_message") or state.get("error") or "알 수 없는 오류")
+        winerror = state.get("winerror")
+        prefix = f"WinError {winerror}: " if winerror is not None and f"WinError {winerror}" not in error else ""
+        summary = f"❌ 업데이트 {'롤백' if status == 'rolled_back' else '실패'} · {phase} · {prefix}{error}"
+        self.append_log(summary)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("업데이트 실패" if status == "failed" else "업데이트 롤백")
+        box.setText(f"단계: {phase}\n\n{prefix}{error}")
+        log_path = Path(str(state.get("log_path") or ""))
+        log_button = box.addButton("로그 열기", QMessageBox.ActionRole) if log_path.is_file() else None
+        box.addButton(QMessageBox.Ok)
+        box.exec()
+        mark_shown()
+        if log_button is not None and box.clickedButton() is log_button:
+            open_path(log_path)
 
     def _apply_automation_defaults(self) -> None:
         if self.db.get_bool("automation_035_initialized", False):
@@ -1237,16 +1263,21 @@ class MainWindow(QMainWindow):
                 self.status.setText("업데이트가 취소되었습니다.")
                 return
 
-            self.status.setText("업데이트 다운로드 및 검증 중…")
+            self.status.setText("업데이트 파일 다운로드 중...")
 
-            def install_job(_progress):
+            def install_job(report):
+                report("UPDATE", "업데이트 파일 다운로드 중...", 1, 4)
                 archive = download(info)
+                report("UPDATE", "업데이트 서명 및 SHA 검증 완료", 2, 4)
+                report("UPDATE", "업데이트 설치 준비 중...", 3, 4)
                 package = stage(info, archive)
+                report("UPDATE", "Updater 실행 · 프로그램을 종료합니다", 4, 4)
                 launch_helper(info, package)
                 return {"version": info.version}
 
             install_task = TaskThread(install_job, self)
             self.task = install_task
+            install_task.progress.connect(lambda _code, message, _current, _total: self.status.setText(message))
 
             def install_ready(value):
                 self.task = None

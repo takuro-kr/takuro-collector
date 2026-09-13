@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import requests
 
 from .paths import data_root
+from .update_diagnostics import active_log, begin_log, log_phase, write_state
 
 SCHEMA_VERSION = 1
 MAX_PACKAGE_SIZE = 350 * 1024 * 1024
@@ -34,11 +35,7 @@ class UpdateError(RuntimeError):
 
 
 def _write_state(value: str, error: str = "") -> None:
-    root = data_root() / "updates"
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "state.json").write_text(
-        json.dumps({"state": value, "error": error}, ensure_ascii=False), encoding="utf-8"
-    )
+    write_state("failed" if value == "failed" else "in_progress", value, error=error or None)
 
 
 @dataclass(frozen=True)
@@ -85,6 +82,19 @@ def check(manifest_url: str, current_version: str, *, timeout: int = 15,
           allowed_hosts: set[str] | frozenset[str] = ALLOWED_UPDATE_HOSTS,
           public_key_b64: str = PUBLIC_UPDATE_KEY_B64,
           require_signature: bool = True) -> UpdateInfo | None:
+    begin_log(current_version)
+    log_phase("manifest_check", manifest_url=manifest_url, from_version=current_version)
+    try:
+        return _check_manifest(manifest_url, current_version, timeout, allowed_hosts, public_key_b64, require_signature)
+    except Exception as exc:
+        log_phase("manifest_failed", str(exc), error_type=type(exc).__name__, winerror=getattr(exc, "winerror", None))
+        write_state("failed", "manifest_check", from_version=current_version, error=exc)
+        raise
+
+
+def _check_manifest(manifest_url: str, current_version: str, timeout: int,
+                    allowed_hosts: set[str] | frozenset[str], public_key_b64: str,
+                    require_signature: bool) -> UpdateInfo | None:
     manifest_host = _https_host(manifest_url)
     hosts = {host.lower() for host in allowed_hosts}
     if manifest_host not in hosts:
@@ -103,6 +113,7 @@ def check(manifest_url: str, current_version: str, *, timeout: int = 15,
         raise UpdateError("지원하지 않는 업데이트 정보 형식입니다.")
     if require_signature:
         verify_signature(payload, public_key_b64)
+        log_phase("signature_verified")
     notes = payload.get("release_notes", [])
     if not isinstance(notes, list) or not all(isinstance(note, str) for note in notes):
         raise UpdateError("업데이트 변경 내용 형식이 올바르지 않습니다.")
@@ -129,10 +140,12 @@ def check(manifest_url: str, current_version: str, *, timeout: int = 15,
         raise UpdateError("업데이트 SHA-256 값이 올바르지 않습니다.")
     if info.size <= 0 or info.size > MAX_PACKAGE_SIZE:
         raise UpdateError("업데이트 파일 크기가 허용 범위를 벗어났습니다.")
+    log_phase("manifest_verified", from_version=current_version, to_version=info.version)
     return info if _version(info.version) > _version(current_version) else None
 
 
 def download(info: UpdateInfo, *, timeout: int = 120) -> Path:
+    log_phase("download", source=info.url, to_version=info.version)
     if _https_host(info.url) not in ALLOWED_UPDATE_HOSTS:
         raise UpdateError("허용되지 않은 업데이트 다운로드 서버입니다.")
     target_dir = data_root() / "updates" / "downloads"
@@ -165,12 +178,14 @@ def download(info: UpdateInfo, *, timeout: int = 120) -> Path:
             raise UpdateError("업데이트 파일 크기가 manifest와 일치하지 않습니다.")
         if digest.hexdigest().lower() != info.sha256:
             raise UpdateError("업데이트 파일의 SHA-256이 일치하지 않습니다.")
+        log_phase("sha_verified", source=temp_path, size=written)
         temp_path.replace(final_path)
         _write_state("verified")
         return final_path
     except Exception as exc:
+        log_phase("download_failed", str(exc), error_type=type(exc).__name__, winerror=getattr(exc, "winerror", None))
         temp_path.unlink(missing_ok=True)
-        _write_state("failed", str(exc))
+        write_state("failed", "download", to_version=info.version, error=exc)
         raise
 
 
@@ -183,6 +198,7 @@ def _safe_member(name: str) -> bool:
 def stage(info: UpdateInfo, archive: Path) -> Path:
     destination = data_root() / "updates" / "staging" / f"{info.version}-{uuid.uuid4().hex}"
     destination.mkdir(parents=True, exist_ok=False)
+    log_phase("staging", source=archive, destination=destination, to_version=info.version)
     try:
         with zipfile.ZipFile(archive) as bundle:
             members = bundle.infolist()
@@ -201,10 +217,14 @@ def stage(info: UpdateInfo, archive: Path) -> Path:
         if metadata != {"schema_version": SCHEMA_VERSION, "version": info.version}:
             raise UpdateError("manifest와 package 버전이 일치하지 않습니다.")
         _write_state("staged")
+        log_phase("staged", destination=package)
         return package
     except Exception as exc:
+        log_phase("staging_failed", str(exc), source=archive, destination=destination,
+                  error_type=type(exc).__name__, winerror=getattr(exc, "winerror", None))
         shutil.rmtree(destination, ignore_errors=True)
-        _write_state("failed", str(exc))
+        write_state("failed", "staging", to_version=info.version, error=exc,
+                    source_path=archive, destination_path=destination)
         raise
 
 
@@ -214,7 +234,10 @@ def launch_helper(info: UpdateInfo, package: Path) -> None:
     install_dir = Path(sys.executable).resolve().parent
     source_helper = install_dir / "TAKURO Updater.exe"
     if not source_helper.is_file():
-        raise UpdateError("업데이트 helper를 찾을 수 없습니다.")
+        error = UpdateError("업데이트 helper를 찾을 수 없습니다.")
+        log_phase("helper_launch_failed", str(error), install_dir=install_dir)
+        write_state("failed", "helper_launch", to_version=info.version, error=error, install_dir=install_dir)
+        raise error
     update_root = data_root() / "updates"
     helper_dir = update_root / "helper"
     helper_dir.mkdir(parents=True, exist_ok=True)
@@ -225,9 +248,19 @@ def launch_helper(info: UpdateInfo, package: Path) -> None:
     command_path.write_text(json.dumps({"version": info.version, "pid": os.getpid(),
         "install_dir": str(install_dir), "staged_dir": str(package.resolve()),
         "data_root": str(data_root().resolve()), "marker": str(marker), "token": token,
-        "executable": EXECUTABLE_NAME}), encoding="utf-8")
-    subprocess.Popen(
-        [str(helper_copy), str(command_path)],
-        close_fds=True,
-        cwd=str(helper_dir.resolve()),
-    )
+        "executable": EXECUTABLE_NAME, "from_version": __import__("takuro_collector", fromlist=["__version__"]).__version__,
+        "log_path": str(active_log())}), encoding="utf-8")
+    log_phase("helper_launch", install_dir=install_dir, staged_dir=package.resolve(), helper_cwd=helper_dir.resolve(),
+              parent_pid=os.getpid(), to_version=info.version)
+    try:
+        subprocess.Popen(
+            [str(helper_copy), str(command_path)],
+            close_fds=True,
+            cwd=str(helper_dir.resolve()),
+        )
+    except Exception as exc:
+        log_phase("helper_launch_failed", str(exc), error_type=type(exc).__name__,
+                  winerror=getattr(exc, "winerror", None), install_dir=install_dir, helper_cwd=helper_dir.resolve())
+        write_state("failed", "helper_launch", to_version=info.version, error=exc,
+                    install_dir=install_dir, helper_cwd=helper_dir.resolve())
+        raise
