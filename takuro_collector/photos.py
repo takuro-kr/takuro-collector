@@ -18,6 +18,7 @@ from .utils import safe_filename
 
 Progress = Callable[[str, int, int], None]
 logger = logging.getLogger(__name__)
+REFERENCE_PHOTO_NOTICE = "다른 호실의 유사 타입 참고사진입니다."
 
 
 def _trim_white_margin(image: Image.Image) -> Image.Image:
@@ -74,10 +75,44 @@ def _watermark(image: Image.Image, text: str = "TAKURO") -> Image.Image:
     return Image.alpha_composite(base, overlay)
 
 
-def _prepare_photo(data: bytes, ext: str) -> tuple[bytes, str]:
+def _reference_footer(image: Image.Image, text: str = REFERENCE_PHOTO_NOTICE) -> Image.Image:
+    """Append a small GOO reference-photo notice without covering source pixels."""
+    rgb = image.convert("RGB")
+    font_size = max(13, min(24, int(rgb.width * 0.032)))
+    font = None
+    font_path = ""
+    for name in (r"C:\Windows\Fonts\malgun.ttf", r"C:\Windows\Fonts\malgunsl.ttf"):
+        try:
+            font = ImageFont.truetype(name, font_size)
+            font_path = name
+            break
+        except OSError:
+            pass
+    if font is None:
+        raise RuntimeError("Goodcom 참고사진 안내문용 Windows 한글 글꼴을 찾을 수 없습니다.")
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    bounds = probe.textbbox((0, 0), text, font=font)
+    text_width, text_height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+    if text_width > rgb.width - 16:
+        font_size = max(10, int(font_size * (rgb.width - 16) / text_width))
+        font = ImageFont.truetype(font_path, font_size)
+        bounds = probe.textbbox((0, 0), text, font=font)
+        text_width, text_height = bounds[2] - bounds[0], bounds[3] - bounds[1]
+    footer_height = max(28, text_height + 14)
+    output = Image.new("RGB", (rgb.width, rgb.height + footer_height), (245, 245, 245))
+    output.paste(rgb, (0, 0))
+    draw = ImageDraw.Draw(output)
+    draw.text(((rgb.width - text_width) // 2, rgb.height + (footer_height - text_height) // 2 - bounds[1]),
+              text, font=font, fill=(45, 45, 45))
+    return output
+
+
+def _prepare_photo(data: bytes, ext: str, *, reference_notice: bool = False) -> tuple[bytes, str]:
     """Crop provider padding and add a watermark without resizing the source."""
     with Image.open(io.BytesIO(data)) as opened:
         image = _watermark(_trim_white_margin(opened))
+        if reference_notice:
+            image = _reference_footer(image)
         output = io.BytesIO()
         if ext == "png":
             image.save(output, format="PNG", optimize=True)
@@ -167,7 +202,10 @@ class PhotoManager:
                 ext = _kind_from_bytes(data, content_type, str(row["source_url"]))
                 if not ext:
                     raise RuntimeError("JPEG/PNG/WebP 이미지가 아닙니다.")
-                data, ext = _prepare_photo(data, ext)
+                data, ext = _prepare_photo(
+                    data, ext,
+                    reference_notice=site_code == "GOO" and str(row.get("kind")) == "reference_photo",
+                )
                 digest = hashlib.sha256(data).hexdigest()
                 if digest in seen_hashes:
                     self.db.mark_photo(int(row["id"]), status="duplicate", sha256=digest)

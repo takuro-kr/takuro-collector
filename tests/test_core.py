@@ -46,7 +46,7 @@ HTML = """
 """
 
 
-def sample_candidate(url="https://www.goodcomasset-gc.co.jp/bkndetail/2673365286/room101312034/"):
+def sample_candidate(url="https://ref.namiki-grp.co.jp/estate/building2327959/room6472696"):
     adapter = adapter_for_url(url)
     assert adapter is not None
     return adapter.parse(HTML, url)
