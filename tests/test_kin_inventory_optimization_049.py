@@ -9,7 +9,7 @@ from takuro_collector.sites.base import DiscoveryResult
 from takuro_collector.sites.kinoshita import KinoshitaAdapter
 
 
-def candidate(source_id: str, *, rent: int = 59000) -> PropertyCandidate:
+def candidate(source_id: str, *, rent: int = 59000, with_photo: bool = False) -> PropertyCandidate:
     return PropertyCandidate(
         source_site="kinoshita-chintai.com",
         source_property_id=source_id,
@@ -23,6 +23,8 @@ def candidate(source_id: str, *, rent: int = 59000) -> PropertyCandidate:
         management_fee=3500,
         layout="1K",
         area=26.08,
+        photo_sources=([{"url": f"https://kinoshita-chintai.com/photos/{source_id}.jpg"}]
+                       if with_photo else []),
     )
 
 
@@ -102,6 +104,27 @@ def test_kin_recent_unchanged_skips_detail_and_photo_pipeline(monkeypatch, tmp_p
     assert result.detail_attempted == 0
     assert any("기존/변화없음, 상세 생략" in message for message in messages)
     assert not any("신규, 상세 수집" in message for message in messages)
+
+
+def test_kin_recent_unchanged_resumes_pending_photos_without_detail(monkeypatch, tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    property_id, _ = db.upsert_property(candidate("pending_1", with_photo=True))
+    adapter = InventoryKinAdapter([inventory_item("pending_1")])
+    downloads = []
+
+    def download(_self, pid):
+        downloads.append(pid)
+        return {"downloaded": 1, "failed": 0}
+
+    monkeypatch.setattr(collector_module.PhotoManager, "download_for_property", download)
+    messages = []
+    result = run(monkeypatch, db, adapter, lambda _code, message, *_args: messages.append(message))
+
+    assert adapter.detail_calls == []
+    assert downloads == [property_id]
+    assert result.detail_attempted == 0
+    assert result.existing_count == 1
+    assert any("기존/변화없음, 미완료 사진 재개" in message for message in messages)
 
 
 def test_kin_list_change_forces_detail_refresh_and_matching_log(monkeypatch, tmp_path):

@@ -201,10 +201,37 @@ class CollectorEngine:
                     if existing is not None and callable(precheck):
                         action = precheck(existing, item)
                         if action == "unchanged":
+                            has_photo_work = False
+                            # KIN scans created before the inventory precheck can
+                            # still have valid, already-discovered photo rows that
+                            # were never downloaded.  Do not fetch detail again,
+                            # but do let that finite local backlog resume.
+                            if adapter.code == "KIN":
+                                property_id = int(existing["id"])
+                                photo_rows = self.db.photos(property_id)
+                                has_photo_work = any(
+                                    str(row.get("status") or "pending") not in {"downloaded", "duplicate"}
+                                    for row in photo_rows
+                                )
+                                if has_photo_work:
+                                    if progress:
+                                        progress(
+                                            adapter.code,
+                                            f"{adapter.label} {uidx}/{len(urls)} - 기존/변화없음, 미완료 사진 재개",
+                                            index,
+                                            len(enabled),
+                                        )
+                                    photo_result = PhotoManager(self.db, self.fetcher).download_for_property(property_id)
+                                    if photo_result.get("failed"):
+                                        result.messages.append(
+                                            f"{adapter.code} {existing.get('building_name', '')} "
+                                            f"{existing.get('room', '')}: 사진 일부 실패 "
+                                            f"{photo_result.get('failed')}개"
+                                        )
                             site_total += 1
                             result.discovered += 1
                             result.existing_count += 1
-                            if progress:
+                            if progress and not (adapter.code == "KIN" and has_photo_work):
                                 progress(adapter.code, f"{adapter.label} {uidx}/{len(urls)} - 기존/변화없음, 상세 생략", index, len(enabled))
                             continue
                         reason = "변경 감지, 상세 재확인" if action == "changed" else "기존, 정기 재확인"
