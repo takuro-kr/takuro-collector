@@ -243,6 +243,26 @@ def verify_https(release: LocalRelease, fetch: Callable[[str], bytes] = _http_by
             raise PublishError("query 없는 latest.json까지 새 버전으로 갱신되지 않았습니다.")
 
 
+def check_connection(ftp: ftplib.FTP_TLS) -> tuple[str, str, list[str]]:
+    pwd = ftp.pwd()
+    root_entries = {name for name, _facts in ftp.mlsd("/")}
+    if "latest.json" not in root_entries:
+        raise PublishError("/latest.json을 찾을 수 없습니다.")
+    if "releases" not in root_entries:
+        raise PublishError("/releases를 찾을 수 없습니다.")
+    try:
+        latest = json.loads(_download_bytes(ftp, "/latest.json").decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise PublishError(f"/latest.json parse 실패: {exc}") from exc
+    version = str(latest.get("version") or "") if isinstance(latest, dict) else ""
+    _version(version)
+    releases = sorted(
+        (name for name, facts in ftp.mlsd("/releases") if facts.get("type") == "dir"),
+        key=lambda value: _version(value) if SEMVER.fullmatch(value) else (),
+    )
+    return pwd, version, releases
+
+
 def publish(release: LocalRelease, ftp: ftplib.FTP_TLS,
             https_check: Callable[[LocalRelease], None] = verify_https) -> list[str]:
     version, name = release.manifest["version"], release.archive_path.name
@@ -303,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Publish a verified TAKURO Collector release over explicit FTPS")
     parser.add_argument("--output", type=Path, default=ROOT / "release-output")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--check-connection", action="store_true")
     return parser
 
 
@@ -310,6 +331,24 @@ def main() -> int:
     args = build_parser().parse_args()
     password = ""
     try:
+        if args.check_connection:
+            username, password = read_windows_credential()
+            if username != USERNAME:
+                raise PublishError("Credential Manager의 username이 배포 계정과 일치하지 않습니다.")
+            _console("credential load OK")
+            ftp = connect_ftps(username, password)
+            try:
+                pwd, version, releases = check_connection(ftp)
+            finally:
+                try:
+                    ftp.quit()
+                except Exception:
+                    ftp.close()
+            _console("FTPS login OK")
+            _console(f"pwd: {pwd}")
+            _console(f"latest version: {version}")
+            _console(f"releases: {', '.join(releases) if releases else '없음'}")
+            return 0
         _console("[local_verify] manifest/signature/ZIP/package 검증")
         release = validate_local(args.output)
         _console(f"검증 완료: v{release.manifest['version']} ({release.archive_size} bytes)")

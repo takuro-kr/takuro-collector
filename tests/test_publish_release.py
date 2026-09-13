@@ -98,6 +98,15 @@ class FakeFTP:
     def rmd(self, path):
         self.dirs.remove(path); self.operations.append(("rmd", path))
 
+    def pwd(self):
+        return "/"
+
+    def quit(self):
+        self.operations.append(("quit",))
+
+    def close(self):
+        self.operations.append(("close",))
+
 
 def test_validate_local_checks_signature_sha_and_package(tmp_path, monkeypatch):
     output, manifest = make_release(tmp_path, monkeypatch)
@@ -188,3 +197,32 @@ def test_verify_https_requires_plain_and_cache_busted_latest(tmp_path, monkeypat
         return json.dumps(manifest if "?verify=" in url else stale).encode()
     with pytest.raises(Exception, match="Ed25519|signature|latest.json"):
         publisher.verify_https(release, fetch)
+
+
+def test_check_connection_is_strictly_read_only(monkeypatch, capsys):
+    password = "connection-test-password"
+    ftp = FakeFTP()
+    ftp.files["/latest.json"] = json.dumps({"version": "0.4.12"}).encode()
+    ftp.dirs |= {"/releases/0.4.11", "/releases/0.4.12"}
+    monkeypatch.setattr(publisher, "read_windows_credential", lambda: (publisher.USERNAME, password))
+    monkeypatch.setattr(publisher, "connect_ftps", lambda *_args: ftp)
+    monkeypatch.setattr(publisher.sys, "argv", ["publish_release.py", "--check-connection"])
+    assert publisher.main() == 0
+    output = capsys.readouterr().out
+    assert "credential load OK" in output and "FTPS login OK" in output
+    assert "pwd: /" in output and "latest version: 0.4.12" in output
+    assert "0.4.11, 0.4.12" in output and password not in output
+    assert not any(operation[0] in {"store", "mkd", "rename", "delete", "rmd"}
+                   for operation in ftp.operations)
+
+
+def test_check_connection_failure_redacts_password(monkeypatch, capsys):
+    password = "connection-secret"
+    monkeypatch.setattr(publisher, "read_windows_credential", lambda: (publisher.USERNAME, password))
+    monkeypatch.setattr(publisher, "connect_ftps",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError(password)))
+    monkeypatch.setattr(publisher.sys, "argv", ["publish_release.py", "--check-connection"])
+    assert publisher.main() == 1
+    output = capsys.readouterr()
+    assert password not in output.out + output.err
+    assert "[REDACTED]" in output.err
