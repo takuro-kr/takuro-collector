@@ -122,3 +122,29 @@ Required Follow-up:\
 
 Status:\
 Collector 구현 및 로컬 계약 회귀 완료 / 배포 후 WordPress 단건 연결 확인 필요
+
+## 2026-09-14 - Collector inventory delivery outbox 및 Registration endpoint 전환 준비
+
+Component:\
+TAKURO Collector
+
+Change:\
+complete inventory discovery마다 안정적인 run을 생성하고 미전송 run을 덮어쓰지 않는 append-only delivery outbox를 추가했다. 신규 outbox delivery는 Registration V2 canonical inventory endpoint를 사용하며 기존 Connect inventory endpoint 코드는 호환 검증용으로 유지했다.
+
+Reason:\
+네트워크 실패·앱 종료·새 discovery 발생 시에도 동일 inventory run을 유실하지 않고 동일 run_id로 멱등 재전송하며, lifecycle 단일 writer를 Registration V2로 이전하기 위해서다.
+
+Interface/Data Changes:\
+DB schema는 v6이며 `inventory_delivery_outbox` table을 추가했다. `run_id`는 32자리 lowercase UUIDv4 hex, `completed_at`은 complete discovery 확정 시각의 UTC ISO-8601 Z다. 신규 request endpoint는 `POST /wp-json/takuro-registration/v1/inventory-snapshots`이며 Registration schema 1의 `schema_version=1`, `discovery_status=complete`, `run_id`, `completed_at`과 기존 inventory 의미 필드를 함께 전달한다. 성공에는 boolean `accepted=true`, 동일 `run_id`, 제출 고유 ID 수와 동일한 integer `accepted_count`, 올바른 `duplicate_run` 타입이 필요하다. 상태는 `pending`, `sending`, `accepted`, `retryable_error`, `rejected_terminal`이며 same-site FIFO를 적용한다. 기존 `POST /wp-json/takuro/v1/collection/inventory-snapshot` 코드는 자동 fallback 없이 유지한다.
+
+Affected Components:\
+TAKURO Registration V2 0.7.10의 canonical inventory REST와 배포 순서를 맞춰야 한다. TAKURO Connect legacy inventory writer는 아직 제거하지 않았으며 dual writer가 되지 않도록 전환 시점을 관리해야 한다. Import V2와 Property Search 코드는 변경하지 않았다.
+
+Compatibility:\
+기존 current `inventory_snapshots`와 모든 property/photo/settings 데이터는 유지한다. 유효한 legacy pending/error snapshot은 기존 snapshot_token으로 outbox에 1회 이관하고 synced snapshot은 재전송하지 않는다. 신규 endpoint 실패 시 legacy endpoint로 fallback하지 않는다.
+
+Required Follow-up:\
+Collector와 Registration V2 0.7.10을 함께 운영 배포하기 전에 동일 request/response 계약 로컬 E2E 결과를 확인하고, Connect legacy writer 중단 및 rollback 순서를 총괄 설계에서 승인해야 한다.
+
+Status:\
+Collector 코드·로컬 endpoint E2E·전체 회귀 완료 / Registration V2 0.7.10과 동시 운영 배포 대기

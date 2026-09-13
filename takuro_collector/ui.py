@@ -794,6 +794,15 @@ class MainWindow(QMainWindow):
         self.append_log(f"↻ {stage} 실패 · {minutes}분 후 자동 재시도")
         QTimer.singleShot(minutes * 60 * 1000, lambda: self.collect_all(automatic=True))
 
+    def schedule_sync_retry(self) -> None:
+        """Retry only durable WordPress queues; do not repeat site discovery."""
+        if self.db.get_bool("automation_paused", False):
+            return
+        minutes = int(self.db.get_setting("auto_retry_interval_minutes", "10") or 10)
+        self.automation_state.setText(f"TAKURO 전송 실패 · {minutes}분 후 전송만 재시도")
+        self.append_log(f"↻ TAKURO 전송 실패 · {minutes}분 후 outbox/후보 전송만 재시도")
+        QTimer.singleShot(minutes * 60 * 1000, lambda: self.sync_wordpress(automatic=True))
+
     @staticmethod
     def _compact_log_value(value: Any, *, depth: int = 0) -> Any:
         """Bound expensive result rendering before it reaches QPlainTextEdit."""
@@ -1551,7 +1560,7 @@ class MainWindow(QMainWindow):
             job,
             done_message="TAKURO 동기화 완료",
             after=after,
-            on_fail=(lambda _message: self.schedule_retry("TAKURO 동기화")) if automatic else None,
+            on_fail=(lambda _message: self.schedule_sync_retry()) if automatic else None,
             refresh_on_finish=False,
             quiet_fail=automatic,
         )

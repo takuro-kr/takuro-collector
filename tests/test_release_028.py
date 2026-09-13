@@ -187,11 +187,12 @@ def test_inventory_sync_sends_382_ids_once_and_marks_snapshot_synced(tmp_path, m
     calls = []
 
     class Client:
-        def send_inventory_snapshot(self, **kwargs):
+        def send_inventory_run(self, **kwargs):
             calls.append(kwargs)
             return {
-                'accepted': True, 'baseline_only': False, 'inventory_count': len(kwargs['source_property_ids']),
-                'missing': 3, 'suspected': 2, 'confirmed': 1, 'restored': 4, 'transport': 'rest_json',
+                'accepted': True, 'run_id': kwargs['run_id'],
+                'accepted_count': len(kwargs['source_property_ids']),
+                'duplicate_run': False, 'transport': 'registration_v2_inventory_rest',
             }
 
     sync = WordPressSync(db)
@@ -200,13 +201,10 @@ def test_inventory_sync_sends_382_ids_once_and_marks_snapshot_synced(tmp_path, m
     out = sync.sync_inventory_snapshots(progress_callback=lambda d, t, m: progress.append((d, t, m)))
     assert len(calls) == 1
     assert len(calls[0]['source_property_ids']) == 382
-    assert calls[0]['complete'] is True
-    assert calls[0]['errors'] == 0
-    assert calls[0]['parse_errors'] == 0
-    assert calls[0]['blockers'] == []
+    assert re.fullmatch(r'[0-9a-f]{32}', calls[0]['run_id'])
+    assert calls[0]['completed_at'].endswith('Z')
     assert out['synced_snapshots'] == 1
-    assert out['results'][0]['confirmed'] == 1
-    assert out['results'][0]['restored'] == 4
+    assert out['results'][0]['run_id'] == calls[0]['run_id']
     assert db.pending_inventory_snapshots() == []
     assert any(d == 382 and t == 382 for d, t, _ in progress)
     db.close()
@@ -217,10 +215,10 @@ def test_inventory_sync_does_not_send_malformed_local_snapshot(tmp_path, monkeyp
     db.save_inventory_snapshot('KIN', 'kinoshita-chintai.com', [
         {'source_property_id': 'id-1'}, {'source_property_id': 'id-2'},
     ])
-    db.conn.execute("UPDATE inventory_snapshots SET expected_count=3 WHERE site_code='KIN'")
+    db.conn.execute("UPDATE inventory_delivery_outbox SET expected_count=3 WHERE site_code='KIN'")
     db.conn.commit()
     class Client:
-        def send_inventory_snapshot(self, **kwargs):
+        def send_inventory_run(self, **kwargs):
             raise AssertionError('malformed snapshot must not be sent')
     sync = WordPressSync(db)
     monkeypatch.setattr(sync, 'client', lambda: Client())
@@ -236,7 +234,7 @@ def test_inventory_sync_http_error_keeps_snapshot_unsynced(tmp_path, monkeypatch
     db.save_inventory_snapshot('KIN', 'kinoshita-chintai.com', [{'source_property_id': 'id-1'}])
     from takuro_collector.wordpress import WordPressError
     class Client:
-        def send_inventory_snapshot(self, **kwargs):
+        def send_inventory_run(self, **kwargs):
             raise WordPressError('HTTP 503: upstream unavailable')
     sync = WordPressSync(db)
     monkeypatch.setattr(sync, 'client', lambda: Client())

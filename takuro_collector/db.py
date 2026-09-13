@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -10,7 +13,7 @@ from .models import PropertyCandidate
 from .paths import database_path
 from .utils import extract_prefecture, json_dumps, normalize_room, now_iso
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class Database:
@@ -25,6 +28,7 @@ class Database:
         # every task start. Under load that needlessly competes with the GUI reader.
         if not self._schema_is_current():
             self.install()
+        self.recover_sending_inventory_runs()
 
     def _schema_is_current(self) -> bool:
         try:
@@ -155,6 +159,28 @@ class Database:
                     last_error TEXT NOT NULL DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_inventory_snapshots_sync ON inventory_snapshots(sync_status, created_at);
+
+                CREATE TABLE IF NOT EXISTS inventory_delivery_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL UNIQUE,
+                    site_code TEXT NOT NULL,
+                    source_site TEXT NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    complete INTEGER NOT NULL DEFAULT 1,
+                    expected_count INTEGER NOT NULL,
+                    items_json TEXT NOT NULL,
+                    payload_checksum TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'pending',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    rejected_reason_code TEXT NOT NULL DEFAULT '',
+                    rejected_reason_message TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    last_attempt_at TEXT NOT NULL DEFAULT '',
+                    accepted_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_inventory_outbox_delivery
+                    ON inventory_delivery_outbox(delivery_status, site_code, completed_at, id);
                 """
             )
             self._ensure_property_column("wp_package_job_id", "TEXT NOT NULL DEFAULT ''")
@@ -163,9 +189,112 @@ class Database:
             self._ensure_property_column("wp_asset_state", "TEXT NOT NULL DEFAULT ''")
             self._ensure_property_column("wp_asset_error", "TEXT NOT NULL DEFAULT ''")
             self._ensure_table_column("photos", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+            self._migrate_legacy_inventory_outbox()
             self.conn.execute(
                 "INSERT OR REPLACE INTO settings(key,value) VALUES('schema_version',?)",
                 (str(SCHEMA_VERSION),),
+            )
+
+    @staticmethod
+    def _valid_run_id(value: str) -> bool:
+        text = str(value or "")
+        if not re.fullmatch(r"[0-9a-f]{32}", text):
+            return False
+        try:
+            return uuid.UUID(hex=text).version == 4
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _utc_iso() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    @staticmethod
+    def _as_utc_z(value: str) -> str:
+        text = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+        except ValueError:
+            return ""
+
+    @staticmethod
+    def _canonical_inventory(
+        source_site: str, items: list[dict], *, run_id: str, completed_at: str
+    ) -> tuple[list[dict], str]:
+        unique: dict[str, dict] = {}
+        for raw in items or []:
+            if not isinstance(raw, dict):
+                continue
+            source_id = str(raw.get("source_property_id") or "").strip()[:300]
+            if not source_id:
+                continue
+            unique[source_id] = {
+                "source_property_id": source_id,
+                "building_name": str(raw.get("building_name") or "")[:1000],
+                "room": str(raw.get("room") or "")[:300],
+                "source_url": str(raw.get("source_url") or raw.get("url") or "")[:2000],
+            }
+        rows = [unique[key] for key in sorted(unique)]
+        canonical = {
+            "schema_version": 1,
+            "source_site": source_site,
+            "discovery_status": "complete",
+            "complete": True,
+            "errors": 0,
+            "parse_errors": 0,
+            "blockers": [],
+            "source_property_ids": [row["source_property_id"] for row in rows],
+            "run_id": run_id,
+            "completed_at": completed_at,
+        }
+        raw = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return rows, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _migrate_legacy_inventory_outbox(self) -> None:
+        rows = self.conn.execute(
+            "SELECT * FROM inventory_snapshots WHERE sync_status IN ('pending','error')"
+        ).fetchall()
+        for row in rows:
+            run_id = str(row["snapshot_token"] or "")
+            if not self._valid_run_id(run_id):
+                self.conn.execute(
+                    "UPDATE inventory_snapshots SET last_error=? WHERE site_code=?",
+                    ("legacy snapshot_token 형식이 유효하지 않아 outbox 이관 보류", row["site_code"]),
+                )
+                continue
+            try:
+                items = json.loads(str(row["items_json"] or "[]"))
+            except Exception:
+                items = []
+            completed_at = self._as_utc_z(str(row["created_at"] or ""))
+            if not completed_at:
+                self.conn.execute(
+                    "UPDATE inventory_snapshots SET last_error=? WHERE site_code=?",
+                    ("legacy completed_at 형식이 유효하지 않아 outbox 이관 보류", row["site_code"]),
+                )
+                continue
+            canonical_rows, checksum = self._canonical_inventory(
+                str(row["source_site"] or ""), items, run_id=run_id, completed_at=completed_at
+            )
+            if not canonical_rows or len(canonical_rows) != int(row["expected_count"] or 0):
+                self.conn.execute(
+                    "UPDATE inventory_snapshots SET last_error=? WHERE site_code=?",
+                    ("legacy snapshot payload가 유효하지 않아 outbox 이관 보류", row["site_code"]),
+                )
+                continue
+            self.conn.execute(
+                "INSERT OR IGNORE INTO inventory_delivery_outbox("
+                "run_id,site_code,source_site,completed_at,complete,expected_count,items_json,payload_checksum,"
+                "delivery_status,retry_count,last_error,created_at) VALUES(?,?,?,?,1,?,?,?,?,0,?,?)",
+                (
+                    run_id, row["site_code"], row["source_site"], completed_at,
+                    len(canonical_rows), json.dumps(canonical_rows, ensure_ascii=False, separators=(",", ":")),
+                    checksum, "retryable_error" if row["sync_status"] == "error" else "pending",
+                    str(row["last_error"] or ""), completed_at,
+                ),
             )
 
     def _ensure_property_column(self, name: str, ddl: str) -> None:
@@ -487,41 +616,89 @@ class Database:
                     (state, state, error, now, property_id),
                 )
 
-    def save_inventory_snapshot(self, site_code: str, source_site: str, items: list[dict]) -> dict:
-        """Keep the newest proven-complete site inventory for WordPress sync."""
+    def save_inventory_snapshot(
+        self,
+        site_code: str,
+        source_site: str,
+        items: list[dict],
+        *,
+        run_id: str = "",
+        completed_at: str = "",
+    ) -> dict:
+        """Atomically update the current inventory and append its delivery run."""
         site_code = str(site_code or "").strip().upper()[:32]
         source_site = str(source_site or "").strip().lower()[:300]
-        unique: dict[str, dict] = {}
-        for raw in items or []:
-            if not isinstance(raw, dict):
-                continue
-            source_id = str(raw.get("source_property_id") or "").strip()[:300]
-            if not source_id:
-                continue
-            unique[source_id] = {
-                "source_property_id": source_id,
-                "building_name": str(raw.get("building_name") or "")[:1000],
-                "room": str(raw.get("room") or "")[:300],
-                "source_url": str(raw.get("source_url") or raw.get("url") or "")[:2000],
-            }
-        if not site_code or not source_site or not unique:
+        run_id = str(run_id or uuid.uuid4().hex)
+        completed_at = self._as_utc_z(str(completed_at)) if completed_at else self._utc_iso()
+        if not self._valid_run_id(run_id):
+            raise ValueError("inventory run_id는 32자리 lowercase UUIDv4 hex여야 합니다.")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", completed_at):
+            raise ValueError("inventory completed_at은 UTC ISO-8601 Z 형식이어야 합니다.")
+        rows, checksum = self._canonical_inventory(
+            source_site, items, run_id=run_id, completed_at=completed_at
+        )
+        if not site_code or not source_site or not rows:
             raise ValueError("완전 재고 스냅샷의 사이트/매물 식별자가 비어 있습니다.")
-        token = uuid.uuid4().hex
-        rows = list(unique.values())
-        created_at = now_iso()
+        created_at = self._utc_iso()
         payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
         with self.conn:
+            existing = self.conn.execute(
+                "SELECT site_code,source_site,completed_at,payload_checksum "
+                "FROM inventory_delivery_outbox WHERE run_id=?", (run_id,)
+            ).fetchone()
+            if existing and (
+                str(existing[0]) != site_code
+                or str(existing[1]) != source_site
+                or str(existing[2]) != completed_at
+                or str(existing[3]) != checksum
+            ):
+                raise ValueError("동일 inventory run_id에 서로 다른 payload를 저장할 수 없습니다.")
             self.conn.execute(
                 "INSERT INTO inventory_snapshots(site_code,source_site,snapshot_token,expected_count,items_json,created_at,sync_status,synced_at,last_error) "
                 "VALUES(?,?,?,?,?,?,'pending','','') "
                 "ON CONFLICT(site_code) DO UPDATE SET source_site=excluded.source_site,snapshot_token=excluded.snapshot_token,expected_count=excluded.expected_count,items_json=excluded.items_json,created_at=excluded.created_at,sync_status='pending',synced_at='',last_error=''",
-                (site_code, source_site, token, len(rows), payload, created_at),
+                (site_code, source_site, run_id, len(rows), payload, completed_at),
             )
-        return {"site_code": site_code, "source_site": source_site, "snapshot_token": token, "expected_count": len(rows)}
+            self.conn.execute(
+                "INSERT OR IGNORE INTO inventory_delivery_outbox("
+                "run_id,site_code,source_site,completed_at,complete,expected_count,items_json,payload_checksum,"
+                "delivery_status,retry_count,last_error,created_at) VALUES(?,?,?,?,1,?,?,?,?,0,'',?)",
+                (run_id, site_code, source_site, completed_at, len(rows), payload, checksum, "pending", created_at),
+            )
+        return {
+            "site_code": site_code,
+            "source_site": source_site,
+            "snapshot_token": run_id,
+            "run_id": run_id,
+            "completed_at": completed_at,
+            "payload_checksum": checksum,
+            "expected_count": len(rows),
+        }
 
     def pending_inventory_snapshots(self) -> list[dict]:
+        """Compatibility view of deliverable append-only inventory runs."""
+        return self.pending_inventory_runs()
+
+    def recover_sending_inventory_runs(self) -> None:
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "UPDATE inventory_delivery_outbox SET delivery_status='retryable_error', "
+                    "last_error=CASE WHEN last_error='' THEN '이전 실행 중 전송이 중단되어 재시도 대기' ELSE last_error END "
+                    "WHERE delivery_status='sending'"
+                )
+        except sqlite3.OperationalError:
+            return
+
+    def pending_inventory_runs(self) -> list[dict]:
         rows = self.conn.execute(
-            "SELECT * FROM inventory_snapshots WHERE sync_status IN ('pending','error') ORDER BY created_at ASC"
+            "SELECT o.* FROM inventory_delivery_outbox o "
+            "WHERE o.delivery_status IN ('pending','retryable_error') "
+            "AND NOT EXISTS (SELECT 1 FROM inventory_delivery_outbox prior "
+            "WHERE prior.site_code=o.site_code "
+            "AND prior.delivery_status IN ('pending','sending','retryable_error') "
+            "AND (prior.completed_at<o.completed_at OR (prior.completed_at=o.completed_at AND prior.id<o.id))) "
+            "ORDER BY o.completed_at ASC,o.id ASC"
         ).fetchall()
         out: list[dict] = []
         for row in rows:
@@ -533,7 +710,60 @@ class Database:
             out.append(d)
         return out
 
+    def inventory_outbox_rows(self) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM inventory_delivery_outbox ORDER BY completed_at,id"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def inventory_run_checksum(self, run: dict) -> str:
+        _rows, checksum = self._canonical_inventory(
+            str(run.get("source_site") or ""),
+            list(run.get("items") or []),
+            run_id=str(run.get("run_id") or ""),
+            completed_at=str(run.get("completed_at") or ""),
+        )
+        return checksum
+
+    def mark_inventory_run(
+        self,
+        run_id: str,
+        *,
+        state: str,
+        error: str = "",
+        rejected_code: str = "",
+        rejected_message: str = "",
+    ) -> None:
+        allowed = {"pending", "sending", "accepted", "retryable_error", "rejected_terminal"}
+        if state not in allowed:
+            raise ValueError(f"inventory delivery 상태가 올바르지 않습니다: {state}")
+        now = self._utc_iso()
+        with self.conn:
+            self.conn.execute(
+                "UPDATE inventory_delivery_outbox SET delivery_status=?,"
+                "retry_count=retry_count+CASE WHEN ? IN ('retryable_error','rejected_terminal') THEN 1 ELSE 0 END,"
+                "last_error=?,rejected_reason_code=?,rejected_reason_message=?,"
+                "last_attempt_at=CASE WHEN ?='sending' THEN ? ELSE last_attempt_at END,"
+                "accepted_at=CASE WHEN ?='accepted' THEN ? ELSE accepted_at END WHERE run_id=?",
+                (
+                    state, state, str(error or "")[:2000], str(rejected_code or "")[:128],
+                    str(rejected_message or "")[:2000], state, now, state, now, run_id,
+                ),
+            )
+            if state == "accepted":
+                self.conn.execute(
+                    "UPDATE inventory_snapshots SET sync_status='synced',synced_at=?,last_error='' "
+                    "WHERE snapshot_token=?",
+                    (now, run_id),
+                )
+            elif state in {"retryable_error", "rejected_terminal"}:
+                self.conn.execute(
+                    "UPDATE inventory_snapshots SET sync_status='error',last_error=? WHERE snapshot_token=?",
+                    (str(error or rejected_message or "")[:2000], run_id),
+                )
+
     def mark_inventory_snapshot(self, site_code: str, *, state: str, error: str = "") -> None:
+        """Legacy current-view state helper retained for compatibility tests/tools."""
         state = str(state or "error")[:32]
         with self.conn:
             self.conn.execute(

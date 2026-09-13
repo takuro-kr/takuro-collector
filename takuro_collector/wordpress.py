@@ -12,9 +12,12 @@ import requests
 
 from . import __version__
 from .db import Database
+from .logging_setup import get_logger
 from .package import attach_pdf, create_zip
 from .secrets import protect, unprotect
 from .utils import canonical_host
+
+logger = get_logger("wordpress")
 
 
 class WordPressError(RuntimeError):
@@ -151,6 +154,50 @@ class WordPressClient:
             raise WordPressError("재고 스냅샷 응답 형식을 확인할 수 없습니다.")
         out = dict(data)
         out.setdefault("transport", "rest_json")
+        return out
+
+    def send_inventory_run(
+        self,
+        *,
+        run_id: str,
+        completed_at: str,
+        source_site: str,
+        source_property_ids: list[str],
+    ) -> dict:
+        """Deliver one durable inventory run to Registration V2 without fallback."""
+        ids = sorted({str(v or "").strip()[:300] for v in source_property_ids if str(v or "").strip()})
+        if not re.fullmatch(r"[0-9a-f]{32}", str(run_id or "")):
+            raise WordPressError("inventory run_id 형식이 올바르지 않습니다.")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z", str(completed_at or "")):
+            raise WordPressError("inventory completed_at 형식이 올바르지 않습니다.")
+        if not ids:
+            raise WordPressError("재고 스냅샷 source_property_ids가 비어 있습니다.")
+        payload = {
+            "schema_version": 1,
+            "source_site": str(source_site or "")[:300],
+            "discovery_status": "complete",
+            "complete": True,
+            "errors": 0,
+            "parse_errors": 0,
+            "blockers": [],
+            "source_property_ids": ids,
+            "run_id": str(run_id),
+            "completed_at": str(completed_at),
+        }
+        endpoint = self.registration_api("inventory-snapshots")
+        response = self.session.post(endpoint, json=payload, timeout=self.timeout)
+        try:
+            data = response.json()
+        except Exception:
+            return self._json(response)
+        if not isinstance(data, dict):
+            raise WordPressError("재고 run 응답 형식을 확인할 수 없습니다.")
+        if not response.ok and data.get("accepted") is not False:
+            message = data.get("message") or f"HTTP {response.status_code}"
+            raise WordPressError(f"HTTP {response.status_code}: {message}")
+        out = dict(data)
+        out["http_status"] = int(response.status_code)
+        out.setdefault("transport", "registration_v2_inventory_rest")
         return out
 
     def duplicate_check(self, items: list[dict]) -> dict:
@@ -374,8 +421,19 @@ class WordPressSync:
                     errors += 1
                     state_updates.append({"property_id": int(row["id"]), "state": "error", "error": "WordPress 지역 필터 제외"})
                 else:
-                    synced += 1
-                    state_updates.append({"property_id": int(row["id"]), "state": "synced", "candidate_id": int(item.get("id") or 0), "error": ""})
+                    candidate_id = int(item.get("id") or 0)
+                    if candidate_id <= 0:
+                        errors += 1
+                        state_updates.append({
+                            "property_id": int(row["id"]), "state": "error",
+                            "error": "WordPress 후보 응답에 유효한 candidate ID가 없습니다.",
+                        })
+                    else:
+                        synced += 1
+                        state_updates.append({
+                            "property_id": int(row["id"]), "state": "synced",
+                            "candidate_id": candidate_id, "error": "",
+                        })
             self.db.update_wp_states_batch(state_updates)
             # The Collector sends TXT/photos once. WordPress keeps them privately
             # and later combines the staff-selected REINS PDF without a round trip.
@@ -456,64 +514,144 @@ class WordPressSync:
         make the server compare against an incomplete inventory.
         """
         client = self.client()
-        snapshots = self.db.pending_inventory_snapshots()
+        initial = self.db.pending_inventory_runs()
         synced = 0
         halted = False
         error = ""
         http_status = 0
         transports: dict[str, int] = {}
         results: list[dict] = []
-        for snap in snapshots:
+        attempted: set[str] = set()
+        blocked_sites: set[str] = set()
+        while True:
+            candidates = [
+                row for row in self.db.pending_inventory_runs()
+                if str(row.get("run_id") or "") not in attempted
+                and str(row.get("site_code") or "") not in blocked_sites
+            ]
+            if not candidates:
+                break
+            snap = candidates[0]
+            run_id = str(snap.get("run_id") or "")
             site_code = str(snap.get("site_code") or "")
             source_site = str(snap.get("source_site") or "")
+            completed_at = str(snap.get("completed_at") or "")
             expected = int(snap.get("expected_count") or 0)
             items = list(snap.get("items") or [])
             ids = [str(row.get("source_property_id") or "").strip() for row in items if isinstance(row, dict)]
             ids = sorted({v for v in ids if v})
-            if expected < 1 or len(items) != expected or len(ids) != expected:
-                error = f"{site_code} 재고 스냅샷 로컬 건수 불일치: rows={len(items)} ids={len(ids)} expected={expected}"
-                self.db.mark_inventory_snapshot(site_code, state="error", error=error)
-                results.append({"site_code": site_code, "ok": False, "error": error})
+            attempted.add(run_id)
+            checksum = self.db.inventory_run_checksum(snap)
+            if (
+                expected < 1
+                or int(snap.get("complete") or 0) != 1
+                or len(items) != expected
+                or len(ids) != expected
+                or checksum != str(snap.get("payload_checksum") or "")
+            ):
+                error = (
+                    f"{site_code} inventory run 로컬 검증 실패: rows={len(items)} ids={len(ids)} "
+                    f"expected={expected} complete={snap.get('complete')} checksum_match="
+                    f"{checksum == str(snap.get('payload_checksum') or '')}"
+                )
+                self.db.mark_inventory_run(
+                    run_id, state="rejected_terminal", error=error,
+                    rejected_code="LOCAL_PAYLOAD_INVALID", rejected_message=error,
+                )
+                results.append({"site_code": site_code, "run_id": run_id, "ok": False, "terminal": True, "error": error})
                 continue
             if progress_callback:
-                progress_callback(0, expected, f"{site_code} 나간매물 재고 동기화 준비 · {expected}건")
+                progress_callback(0, expected, f"{site_code} inventory run 전송 준비 · {expected}건 · {run_id[:8]}")
+            self.db.mark_inventory_run(run_id, state="sending")
             try:
-                reply = client.send_inventory_snapshot(
+                reply = client.send_inventory_run(
+                    run_id=run_id,
+                    completed_at=completed_at,
                     source_site=source_site,
                     source_property_ids=ids,
-                    complete=True,
-                    errors=0,
-                    parse_errors=0,
-                    blockers=[],
                 )
                 transport = str(reply.get("transport") or "unknown")
                 transports[transport] = transports.get(transport, 0) + 1
-                if not bool(reply.get("accepted")):
-                    raise WordPressError("재고 스냅샷 서버 승인 응답이 없습니다.")
-                self.db.mark_inventory_snapshot(site_code, state="synced", error="")
+                accepted = reply.get("accepted")
+                if type(accepted) is not bool:
+                    raise WordPressError("inventory 응답 accepted가 boolean이 아닙니다.")
+                if not accepted:
+                    reason = reply.get("rejected_reason")
+                    if not isinstance(reason, dict) or type(reason.get("retryable")) is not bool:
+                        raise WordPressError("inventory 거절 응답 rejected_reason 형식이 올바르지 않습니다.")
+                    code = str(reason.get("code") or "INVENTORY_REJECTED")[:128]
+                    message = str(reason.get("message") or "서버가 inventory run을 거절했습니다.")[:2000]
+                    retryable = bool(reason["retryable"])
+                    state = "retryable_error" if retryable else "rejected_terminal"
+                    self.db.mark_inventory_run(
+                        run_id, state=state, error=message,
+                        rejected_code=code, rejected_message=message,
+                    )
+                    logger.warning(
+                        "inventory delivery rejected site=%s run_id=%s endpoint=registration/inventory-snapshots code=%s message=%s",
+                        site_code, run_id, code, message,
+                    )
+                    results.append({
+                        "site_code": site_code, "run_id": run_id, "ok": False,
+                        "retryable": retryable, "rejected_reason": code, "error": message,
+                    })
+                    if retryable:
+                        blocked_sites.add(site_code)
+                        halted = True
+                        error = f"{site_code} {run_id} {code}: {message}"
+                    continue
+                response_run_id = reply.get("run_id")
+                accepted_count = reply.get("accepted_count")
+                duplicate_run = reply.get("duplicate_run", False)
+                if not isinstance(response_run_id, str) or response_run_id != run_id:
+                    raise WordPressError("inventory 응답 run_id가 로컬 run_id와 일치하지 않습니다.")
+                if type(accepted_count) is not int or accepted_count != expected:
+                    raise WordPressError(
+                        f"inventory accepted_count 불일치: accepted={accepted_count!r} submitted={expected}"
+                    )
+                if type(duplicate_run) is not bool:
+                    raise WordPressError("inventory 응답 duplicate_run이 boolean이 아닙니다.")
+                self.db.mark_inventory_run(run_id, state="accepted", error="")
                 synced += 1
                 results.append({
                     "site_code": site_code,
+                    "run_id": run_id,
                     "ok": True,
                     "expected_count": expected,
-                    "baseline_only": bool(reply.get("baseline_only")),
-                    "missing": int(reply.get("missing") or 0),
-                    "suspected": int(reply.get("suspected") or 0),
-                    "confirmed": int(reply.get("confirmed") or 0),
-                    "restored": int(reply.get("restored") or 0),
+                    "duplicate_run": duplicate_run,
                 })
                 if progress_callback:
-                    progress_callback(expected, expected, f"{site_code} 재고 {expected}/{expected} 전송 완료 · {transport}")
+                    progress_callback(expected, expected, f"{site_code} inventory {expected}/{expected} 승인 완료 · {transport}")
             except Exception as e:
-                halted = True
-                error = str(e)
-                m = re.search(r"HTTP\s+(\d{3})", error, re.I)
-                http_status = int(m.group(1)) if m else 0
-                self.db.mark_inventory_snapshot(site_code, state="error", error=error)
-                results.append({"site_code": site_code, "ok": False, "error": error})
-                break
+                message = str(e)
+                m = re.search(r"HTTP\s+(\d{3})", message, re.I)
+                status = int(m.group(1)) if m else 0
+                retryable = (
+                    isinstance(e, requests.RequestException)
+                    or status in {429, 500, 501, 502, 503, 504}
+                    or status == 0
+                )
+                state = "retryable_error" if retryable else "rejected_terminal"
+                code = f"HTTP_{status}" if status else type(e).__name__.upper()
+                self.db.mark_inventory_run(
+                    run_id, state=state, error=message,
+                    rejected_code=code, rejected_message=message,
+                )
+                logger.warning(
+                    "inventory delivery failed site=%s run_id=%s endpoint=registration/inventory-snapshots code=%s message=%s",
+                    site_code, run_id, code, message,
+                )
+                results.append({
+                    "site_code": site_code, "run_id": run_id, "ok": False,
+                    "retryable": retryable, "error": message,
+                })
+                if retryable:
+                    blocked_sites.add(site_code)
+                    halted = True
+                    error = message
+                    http_status = status
         return {
-            "pending_snapshots": len(snapshots),
+            "pending_snapshots": len(initial),
             "synced_snapshots": synced,
             "halted": halted,
             "http_status": http_status,
