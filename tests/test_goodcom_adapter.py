@@ -36,17 +36,24 @@ class FixtureFetcher:
         return FetchResult(url, self.pages[url], 200, False)
 
 
+def discovery_pages(**replacements):
+    adapter = GoodComAdapter()
+    pages = {
+        adapter.seed_urls[0]: fixture("goodcom_search_page1.html"),
+        "https://www.goodcomasset-gc.co.jp/search/index/?class%5B%5D=c1&pg=2": fixture("goodcom_search_page2.html"),
+        "https://www.goodcomasset-gc.co.jp/bkndetail/100/": fixture("goodcom_building_100.html"),
+        "https://www.goodcomasset-gc.co.jp/bkndetail/200/": fixture("goodcom_building_200.html"),
+    }
+    pages.update(replacements)
+    return pages
+
+
 def test_discovery_follows_pager_then_each_building_and_preserves_complete_inventory():
     adapter = GoodComAdapter()
     page2 = "https://www.goodcomasset-gc.co.jp/search/index/?class%5B%5D=c1&pg=2"
     b1 = "https://www.goodcomasset-gc.co.jp/bkndetail/100/"
     b2 = "https://www.goodcomasset-gc.co.jp/bkndetail/200/"
-    fetcher = FixtureFetcher({
-        adapter.seed_urls[0]: fixture("goodcom_search_page1.html"),
-        page2: fixture("goodcom_search_page2.html"),
-        b1: fixture("goodcom_building_100.html"),
-        b2: fixture("goodcom_building_200.html"),
-    })
+    fetcher = FixtureFetcher(discovery_pages())
     result = adapter.discover(fetcher)
     assert result.urls == [DETAIL, "https://www.goodcomasset-gc.co.jp/bkndetail/100/room9002/",
                            "https://www.goodcomasset-gc.co.jp/bkndetail/200/room9003/"]
@@ -54,18 +61,58 @@ def test_discovery_follows_pager_then_each_building_and_preserves_complete_inven
     assert result.inventory_site == "goodcomasset-gc.co.jp"
     assert fetcher.calls == [adapter.seed_urls[0], page2, b1, b2]
     assert all("9999" not in url for url in result.urls)
+    assert all("9998" not in url for url in result.urls)
+    assert any("검색 표시 4건" in message and "비선택 행 1건" in message for message in result.messages)
 
 
 def test_inventory_merges_optional_visible_signals_without_inventing_missing_values():
     adapter = GoodComAdapter()
     page2 = "https://www.goodcomasset-gc.co.jp/search/index/?class%5B%5D=c1&pg=2"
-    fetcher = FixtureFetcher({adapter.seed_urls[0]: fixture("goodcom_search_page1.html"),
-                              page2: fixture("goodcom_search_page2.html"),
-                              "https://www.goodcomasset-gc.co.jp/bkndetail/100/": fixture("goodcom_building_100.html"),
-                              "https://www.goodcomasset-gc.co.jp/bkndetail/200/": fixture("goodcom_building_200.html")})
+    fetcher = FixtureFetcher(discovery_pages())
     items = adapter.discover(fetcher).inventory_items
     assert items[DETAIL]["change_facts"] == {"rent": 86500, "area": 23.85, "management_fee": 10000, "layout": "1K"}
     assert items["https://www.goodcomasset-gc.co.jp/bkndetail/100/room9002/"]["change_facts"] == {"rent": 95000, "area": 29.75}
+
+
+def test_search_hit_mismatch_and_unselectable_stale_row_do_not_define_inventory():
+    result = GoodComAdapter().discover(FixtureFetcher(discovery_pages()))
+    assert result.listed_count == 3
+    assert len(result.urls) == 3 and result.inventory_complete
+    assert not any("room9998" in url for url in result.urls)
+
+
+def test_building_fetch_failure_makes_inventory_incomplete():
+    pages = discovery_pages()
+    del pages["https://www.goodcomasset-gc.co.jp/bkndetail/200/"]
+    result = GoodComAdapter().discover(FixtureFetcher(pages))
+    assert not result.inventory_complete
+
+
+def test_malformed_authoritative_card_makes_inventory_incomplete():
+    malformed = fixture("goodcom_building_200.html").replace(
+        "</ol>", '<li class="detail-bkn__items"><p class="detail-bkn__text">0301</p></li></ol>')
+    result = GoodComAdapter().discover(FixtureFetcher(discovery_pages(**{
+        "https://www.goodcomasset-gc.co.jp/bkndetail/200/": malformed})))
+    assert not result.inventory_complete
+
+
+@pytest.mark.parametrize("building_html", [
+    fixture("goodcom_building_100.html").replace("</ol>", fixture("goodcom_building_100.html").split("<ol class=\"detail-bkn\">", 1)[1].split("</ol>", 1)[0] + "</ol>"),
+    fixture("goodcom_building_100.html").replace("/room9002/", "/room9001/"),
+    fixture("goodcom_building_100.html").replace(">0102<", ">0101<"),
+])
+def test_duplicate_url_id_or_building_room_makes_inventory_incomplete(building_html):
+    result = GoodComAdapter().discover(FixtureFetcher(discovery_pages(**{
+        "https://www.goodcomasset-gc.co.jp/bkndetail/100/": building_html})))
+    assert not result.inventory_complete
+
+
+def test_active_looking_search_room_missing_from_building_is_incomplete():
+    active = fixture("goodcom_search_page1.html").replace(
+        '<td>date</td><td>0999</td><td>9階</td><td><span class="price">-</span></td>',
+        '<td><input name="bknId[]" value="9998"></td><td>0999</td><td>9階</td><td><span class="price">9.0</span>万円</td>')
+    result = GoodComAdapter().discover(FixtureFetcher(discovery_pages(**{GoodComAdapter.seed_urls[0]: active})))
+    assert not result.inventory_complete
 
 
 def test_site_identity_and_management_contract_are_canonical():

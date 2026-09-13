@@ -121,7 +121,11 @@ def _search_page(html: str, page_url: str) -> tuple[dict[str, int], dict[str, di
         url = _canonical_detail(urljoin(page_url, str(anchor.get("href") or ""))) if anchor else ""
         identity = _identity(url)
         if identity:
-            visible_rooms[url] = {"source_property_id": identity[1], "source_url": url, "change_facts": _list_room_facts(row)}
+            facts = _list_room_facts(row)
+            visible_rooms[url] = {
+                "source_property_id": identity[1], "source_url": url, "change_facts": facts,
+                "active_looking": bool(row.select_one("input[name='bknId[]']")) and bool(facts.get("rent")),
+            }
     pages: list[str] = []
     for anchor in soup.select(".pager a[href*='pg='], a[href*='/search/index/'][href*='pg=']"):
         target = _canonical_search(urljoin(page_url, str(anchor.get("href") or "")))
@@ -134,26 +138,34 @@ def _search_page(html: str, page_url: str) -> tuple[dict[str, int], dict[str, di
     return buildings, visible_rooms, pages, reported_rooms
 
 
-def _building_rooms(html: str, page_url: str) -> list[dict]:
+def _building_rooms(html: str, page_url: str) -> tuple[list[dict], int, int]:
     soup = BeautifulSoup(html, "html.parser")
     result: list[dict] = []
-    for card in soup.select("#target-allview li.detail-bkn__items"):
+    cards = soup.select("#target-allview li.detail-bkn__items")
+    malformed = 0
+    page_building = _building_url(page_url)
+    page_identity = _BUILDING_PATH.fullmatch(urlsplit(page_building).path) if page_building else None
+    building_id = page_identity.group("building_id") if page_identity else ""
+    for card in cards:
         anchor = card.select_one("a.detail-bkn__link[href*='/room']")
         url = _canonical_detail(urljoin(page_url, str(anchor.get("href") or ""))) if anchor else ""
         identity = _identity(url)
-        if not identity:
+        text_nodes = card.select(".detail-bkn__text")
+        room_display = normalize_room(text_nodes[0].get_text(" ", strip=True)) if text_nodes else ""
+        if not identity or identity[0] != building_id or not room_display:
+            malformed += 1
             continue
         facts: dict[str, object] = {}
         price = card.select_one(".detail-bkn__price")
-        text_nodes = card.select(".detail-bkn__text")
         rent = parse_yen(price.get_text(" ", strip=True)) if price else 0
         area = parse_area(text_nodes[1].get_text(" ", strip=True)) if len(text_nodes) > 1 else None
         if rent:
             facts["rent"] = rent
         if area is not None:
             facts["area"] = area
-        result.append({"source_property_id": identity[1], "source_url": url, "change_facts": facts})
-    return result
+        result.append({"source_property_id": identity[1], "source_url": url, "change_facts": facts,
+                       "_building_id": building_id, "_room_display": room_display})
+    return result, len(cards), malformed
 
 
 def _transport(node) -> list[dict]:
@@ -250,7 +262,11 @@ class GoodComAdapter(BaseAdapter):
 
         inventory: dict[str, dict] = {}
         building_failures = 0
-        expected_count = sum(buildings.values())
+        malformed_cards = 0
+        raw_cards = 0
+        room_ids: list[str] = []
+        canonical_urls: list[str] = []
+        building_rooms: list[tuple[str, str]] = []
         for index, building_url in enumerate(buildings, start=1):
             cancel_check = getattr(self, "cancel_check", None)
             if cancel_check:
@@ -261,28 +277,44 @@ class GoodComAdapter(BaseAdapter):
                 building_failures += 1
                 continue
             any_browser = any_browser or page.via_browser
-            for item in _building_rooms(page.html, page.url):
+            found, card_count, malformed = _building_rooms(page.html, page.url)
+            raw_cards += card_count
+            malformed_cards += malformed
+            if not page.html or not BeautifulSoup(page.html, "html.parser").select_one("#target-allview"):
+                building_failures += 1
+                continue
+            for item in found:
                 richer = visible_rooms.get(item["source_url"])
                 if richer:
                     item["change_facts"].update(richer.get("change_facts") or {})
+                room_ids.append(str(item["source_property_id"]))
+                canonical_urls.append(str(item["source_url"]))
+                building_rooms.append((str(item.pop("_building_id")), str(item.pop("_room_display"))))
                 inventory.setdefault(item["source_url"], item)
 
-        # A building page can change between the search response and this request.
-        # Keep every room that was explicitly present in the canonical result area,
-        # while still requiring the site's reported total for completeness.
-        for url, item in visible_rooms.items():
-            if url in inventory:
-                inventory[url]["change_facts"].update(item.get("change_facts") or {})
-            else:
-                inventory[url] = item
-
         urls = list(inventory)
-        expected_count = reported_rooms or expected_count
-        complete = bool(buildings and not building_failures and expected_count and len(urls) == expected_count)
-        messages = [f"GOO 검색 {len(pages_seen)}페이지 / 건물 {len(buildings)}개 / 고유 호실 {len(urls)}개"]
+        active_search_urls = {url for url, item in visible_rooms.items() if item.get("active_looking")}
+        duplicate_ids = len(room_ids) != len(set(room_ids))
+        duplicate_urls = len(canonical_urls) != len(set(canonical_urls))
+        duplicate_building_rooms = len(building_rooms) != len(set(building_rooms))
+        active_missing = active_search_urls - set(urls)
+        complete = bool(
+            buildings and not building_failures and raw_cards and not malformed_cards
+            and not duplicate_ids and not duplicate_urls and not duplicate_building_rooms
+            and not active_missing and len(urls) == raw_cards
+        )
+        stale_search_only = set(visible_rooms) - set(urls)
+        messages = [
+            f"GOO 검색 {len(pages_seen)}페이지 / 건물 {len(buildings)}개 / 현재 모집 호실 {len(urls)}개",
+            f"GOO 검색 표시 {reported_rooms}건 / 검색 전용 비선택 행 {len(stale_search_only)}건",
+        ]
         if not complete:
-            messages.append(f"GOO 표시 공실 {expected_count}건과 상세URL {len(urls)}건 차이 또는 건물 요청 실패 {building_failures}건")
-        return DiscoveryResult(urls, any_browser, listed_count=expected_count, messages=messages,
+            messages.append(
+                f"GOO 완전 재고 보류 - 건물 실패 {building_failures}, 비정상 card {malformed_cards}, "
+                f"ID중복 {duplicate_ids}, URL중복 {duplicate_urls}, 건물+호실중복 {duplicate_building_rooms}, "
+                f"검색 active 누락 {len(active_missing)}"
+            )
+        return DiscoveryResult(urls, any_browser, listed_count=len(urls), messages=messages,
                                inventory_complete=complete, inventory_site=_SITE, inventory_items=inventory)
 
     def existing_inventory_action(self, existing: dict, item: dict, *, now: datetime | None = None) -> str:
