@@ -169,7 +169,10 @@ class CollectorEngine:
                         return
                     saved = self.db.upsert_properties_batch(pending_candidates)
                     manager = PhotoManager(self.db, self.fetcher)
-                    for (property_id, is_new), candidate in zip(saved, pending_candidates):
+                    batch_total = len(pending_candidates)
+                    for batch_index, ((property_id, is_new), candidate) in enumerate(
+                        zip(saved, pending_candidates), start=1
+                    ):
                         site_total += 1
                         result.discovered += 1
                         if is_new:
@@ -186,7 +189,29 @@ class CollectorEngine:
                             for row in photo_rows
                         )
                         if not manager.local_photo_paths(property_id) or (adapter.code == "AMB" and has_photo_work):
-                            photo_result = manager.download_for_property(property_id)
+                            photo_progress = None
+                            if progress and adapter.code == "AMM":
+                                identity = f"{candidate.building_name} {candidate.room}".strip()
+
+                                def photo_progress(message: str, photo_index: int, photo_total: int) -> None:
+                                    # A batch can contain hundreds of photos. Keep
+                                    # the UI visibly alive without writing one log
+                                    # line for every image.
+                                    if photo_index not in {1, photo_total} and photo_index % 5:
+                                        return
+                                    progress(
+                                        adapter.code,
+                                        f"{adapter.label} 사진 처리 · batch {batch_index}/{batch_total} · "
+                                        f"{identity or candidate.source_property_id} · {message}",
+                                        index,
+                                        len(enabled),
+                                    )
+
+                            photo_result = (
+                                manager.download_for_property(property_id, photo_progress)
+                                if photo_progress is not None
+                                else manager.download_for_property(property_id)
+                            )
                             if photo_result.get("failed"):
                                 result.messages.append(
                                     f"{adapter.code} {candidate.building_name} {candidate.room}: "

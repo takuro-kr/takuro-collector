@@ -108,6 +108,30 @@ def test_timeout_room_does_not_prevent_following_room(monkeypatch, tmp_path):
     assert item("151")["source_url"] in result.messages[1]
 
 
+def test_amm_batch_photo_progress_reports_property_and_sampled_photo_position(monkeypatch, tmp_path):
+    db = Database(tmp_path / "db.sqlite")
+    adapter = InventoryAMM([item(str(room_id)) for room_id in range(1, 26)])
+    photo_calls = []
+
+    def download(_self, property_id, progress=None):
+        photo_calls.append(property_id)
+        for photo_index in range(1, 13):
+            progress(f"사진 {photo_index}/12 다운로드", photo_index, 12)
+        return {"downloaded": 12, "failed": 0}
+
+    monkeypatch.setattr(collector_module.PhotoManager, "download_for_property", download)
+    messages = []
+    result = run(monkeypatch, db, adapter, lambda _code, message, *_args: messages.append(message))
+
+    assert len(photo_calls) == 25
+    assert result.new_count == 25
+    assert any("batch 1/25" in message and "AMM 1 101" in message for message in messages)
+    assert any("batch 25/25" in message and "AMM 25 101" in message for message in messages)
+    assert any("사진 5/12 다운로드" in message for message in messages)
+    assert any("사진 12/12 다운로드" in message for message in messages)
+    assert not any("사진 2/12 다운로드" in message for message in messages)
+
+
 def test_cancel_is_checked_immediately_after_timed_out_room(monkeypatch, tmp_path):
     class Cancelled(RuntimeError):
         user_cancelled = True
