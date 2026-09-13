@@ -189,7 +189,11 @@ class Fetcher:
             finally:
                 context.close()
 
-    def fetch(self, url: str, site_code: str, *, force_browser: bool = False, login_expected: bool = False) -> FetchResult:
+    def fetch(
+        self, url: str, site_code: str, *, force_browser: bool = False,
+        login_expected: bool = False, browser_fallback: bool = True,
+    ) -> FetchResult:
+        request_error: Exception | None = None
         if not force_browser:
             try:
                 r = self.session.get(url, timeout=self.timeout, allow_redirects=True)
@@ -199,8 +203,11 @@ class Fetcher:
                 if login_expected and (r.status_code in {401, 403} or "login" in r.url.lower() or "ログイン" in html[:5000]):
                     # Browser profile may already contain a valid session; try it before calling this login-required.
                     pass
-            except requests.RequestException:
-                pass
+            except requests.RequestException as exc:
+                request_error = exc
+            if not browser_fallback:
+                detail = self._post_diagnostic(locals().get("r"), request_error)
+                raise FetchFailed(f"{site_code}: {url} HTTP 수집 실패 ({detail})")
         try:
             return self.browser_fetch(url, site_code, login_expected=login_expected)
         except LoginRequired:
@@ -268,7 +275,10 @@ class Fetcher:
         score = sum(1 for x in login_terms if x.lower() in sample)
         return score >= 2 and ("password" in sample or "パスワード" in sample or "type=\"password\"" in sample)
 
-    def download(self, url: str, site_code: str, *, referer: str = "", cookies: dict[str, str] | None = None) -> tuple[bytes, str]:
+    def download(
+        self, url: str, site_code: str, *, referer: str = "",
+        cookies: dict[str, str] | None = None, browser_fallback: bool = True,
+    ) -> tuple[bytes, str]:
         headers = {"User-Agent": DEFAULT_UA}
         if referer:
             headers["Referer"] = referer
@@ -276,8 +286,12 @@ class Fetcher:
             r = self.session.get(url, headers=headers, cookies=cookies or {}, timeout=self.timeout, allow_redirects=True)
             if r.ok and r.content:
                 return r.content, str(r.headers.get("Content-Type", ""))
-        except requests.RequestException:
-            pass
+        except requests.RequestException as exc:
+            if not browser_fallback:
+                raise FetchFailed(f"{site_code}: {url} 이미지 HTTP 수집 실패 ({exc})") from exc
+        if not browser_fallback:
+            status = getattr(locals().get("r"), "status_code", "response 없음")
+            raise FetchFailed(f"{site_code}: {url} 이미지 HTTP 수집 실패 (HTTP {status})")
         return self._browser_download(url, site_code, referer=referer)
 
     def _browser_download(self, url: str, site_code: str, *, referer: str = "") -> tuple[bytes, str]:

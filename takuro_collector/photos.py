@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import mimetypes
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from .sites import adapter_for_url
 from .utils import safe_filename
 
 Progress = Callable[[str, int, int], None]
+logger = logging.getLogger(__name__)
 
 
 def _trim_white_margin(image: Image.Image) -> Image.Image:
@@ -140,6 +142,8 @@ class PhotoManager:
         downloaded = failed = duplicates = 0
         floorplan_written = False
         cookies = {}
+        adapter = adapter_for_url(str(prop.get("source_url") or ""))
+        site_code = adapter.code if adapter else str(prop["source_site"]).split(".")[0].upper()
         raw = prop.get("raw_payload") or {}
         if isinstance(raw, dict):
             cookies = raw.get("fetch_cookies") or {}
@@ -149,13 +153,14 @@ class PhotoManager:
             if row.get("status") == "downloaded" and row.get("local_path") and Path(str(row["local_path"])).exists():
                 continue
             try:
-                adapter = adapter_for_url(str(prop.get("source_url") or ""))
-                site_code = adapter.code if adapter else str(prop["source_site"]).split(".")[0].upper()
                 data, content_type = self.fetcher.download(
                     str(row["source_url"]),
                     site_code,
                     referer=str(prop.get("source_url") or ""),
                     cookies=cookies if isinstance(cookies, dict) else None,
+                    # AMM is a static public site. A failed CDN request must not
+                    # launch an unbounded browser process and stall the whole run.
+                    browser_fallback=site_code != "AMM",
                 )
                 if len(data) < 100:
                     raise RuntimeError("이미지 바이트가 너무 작습니다.")
@@ -184,6 +189,11 @@ class PhotoManager:
                 self.db.mark_photo(int(row["id"]), status="downloaded", local_path=str(path), sha256=digest)
                 downloaded += 1
             except Exception as e:
+                if site_code == "AMM":
+                    logger.warning(
+                        "AMM photo failed url=%s phase=photo_download error=%s",
+                        row.get("source_url"), e,
+                    )
                 self.db.mark_photo(int(row["id"]), status="error", error=str(e))
                 failed += 1
         state = "ready" if downloaded or any(r.get("status") == "downloaded" for r in self.db.photos(property_id)) else "error"

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+import logging
 from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -11,6 +13,8 @@ from ..extractor import clean_text
 from ..models import PropertyCandidate
 from ..utils import canonical_host, extract_prefecture, normalize_room, parse_area, parse_yen
 from .base import BaseAdapter, DiscoveryResult
+
+logger = logging.getLogger(__name__)
 
 
 _DETAIL_PATH = re.compile(r"^/.+/room(?P<room_id>\d+)\.html$")
@@ -162,6 +166,7 @@ class AMMAdapter(BaseAdapter):
     detail_patterns = (r"/room(\d+)\.html(?:$|[?#])",)
     force_browser = False
     login_expected = False
+    detail_refresh_ttl = timedelta(days=30)
 
     TARGET_ADDRESS_IDS = (
         "13112", "13116", "13119", "13114", "13115", "13206", "13229", "13120",
@@ -208,11 +213,45 @@ class AMMAdapter(BaseAdapter):
         listed = int(re.sub(r"[^0-9]", "", count.group(1))) if count else 0
         return details, pages, listed
 
+    @staticmethod
+    def _inventory_items(html: str, page_url: str) -> list[dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: list[dict] = []
+        for row in soup.select(".list_area .list_detail2 tr[name]"):
+            anchor = row.select_one("td.detail.btn > a[href]")
+            url = urljoin(page_url, str(anchor.get("href") or "")) if anchor else ""
+            room_id = _amm_detail_id(url)
+            if not room_id:
+                continue
+            parsed = urlsplit(url)
+            canonical = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+            cells = row.find_all("td", recursive=False)
+            facts: dict[str, object] = {}
+            if len(cells) >= 7:
+                rent = parse_yen(cells[1].get_text(" ", strip=True))
+                fee = parse_yen(cells[2].get_text(" ", strip=True))
+                layout_match = re.search(
+                    r"[0-9]+(?:SLDK|LDK|DK|K|R)", clean_text(cells[5].get_text(" ", strip=True)), re.I
+                )
+                area = parse_area(cells[6].get_text(" ", strip=True))
+                if rent:
+                    facts["rent"] = rent
+                # Zero is a valid explicit management fee on AMM listings.
+                if clean_text(cells[2].get_text(" ", strip=True)):
+                    facts["management_fee"] = fee
+                if layout_match:
+                    facts["layout"] = layout_match.group(0).upper()
+                if area is not None:
+                    facts["area"] = area
+            items.append({"source_property_id": room_id, "source_url": canonical, "change_facts": facts})
+        return items
+
     def discover(self, fetcher) -> DiscoveryResult:
         queue = list(self.seed_urls)
         seen_pages: set[int] = set()
         seen_details: set[str] = set()
         details: list[str] = []
+        inventory_items: dict[str, dict] = {}
         listed_count = 0
         any_browser = False
         while queue:
@@ -221,7 +260,9 @@ class AMMAdapter(BaseAdapter):
             if page_number in seen_pages:
                 continue
             seen_pages.add(page_number)
-            page = fetcher.fetch(page_url, self.code, force_browser=False, login_expected=False)
+            page = fetcher.fetch(
+                page_url, self.code, force_browser=False, login_expected=False, browser_fallback=False
+            )
             any_browser = any_browser or page.via_browser
             found, pagination, reported = self._page_links(page.html, page.url)
             listed_count = max(listed_count, reported)
@@ -229,6 +270,8 @@ class AMMAdapter(BaseAdapter):
                 if url not in seen_details:
                     seen_details.add(url)
                     details.append(url)
+            for item in self._inventory_items(page.html, page.url):
+                inventory_items.setdefault(item["source_url"], item)
             for url in pagination:
                 next_page = int(dict(parse_qsl(urlsplit(url).query)).get("pg", "1"))
                 canonical_page = self.seed_urls[0] + (f"&pg={next_page}" if next_page > 1 else "")
@@ -237,23 +280,61 @@ class AMMAdapter(BaseAdapter):
         messages = [f"AMM 페이지 {len(seen_pages)} / 고유 상세URL {len(details)}"]
         if listed_count and len(details) != listed_count:
             messages.append(f"AMM 표시 공실 {listed_count}건과 상세URL {len(details)}건 차이 확인 필요")
-        return DiscoveryResult(details, any_browser, listed_count=listed_count, messages=messages)
+        complete = bool(listed_count and len(details) == listed_count and len(inventory_items) == len(details))
+        return DiscoveryResult(
+            details, any_browser, listed_count=listed_count, messages=messages,
+            inventory_complete=complete, inventory_site="otoku-chintai.com",
+            inventory_items=inventory_items,
+        )
+
+    def existing_inventory_action(self, existing: dict, item: dict, *, now: datetime | None = None) -> str:
+        facts = dict(item.get("change_facts") or {})
+        for key in ("rent", "management_fee", "layout", "area"):
+            if key not in facts:
+                continue
+            old, new = existing.get(key), facts[key]
+            if key == "area":
+                if old is None or abs(float(old) - float(new)) > 0.001:
+                    return "changed"
+            elif key == "layout":
+                match = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", str(old or ""), re.I)
+                if not match or match.group(0).upper() != str(new).upper():
+                    return "changed"
+            elif int(old or 0) != int(new or 0):
+                return "changed"
+        try:
+            refreshed = datetime.fromisoformat(str(existing.get("last_seen_at") or ""))
+            if refreshed.tzinfo is None:
+                refreshed = refreshed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return "ttl"
+        current = now or datetime.now(timezone.utc).astimezone()
+        return "ttl" if current - refreshed >= self.detail_refresh_ttl else "unchanged"
 
     def collect_url(self, fetcher, url: str) -> PropertyCandidate:
-        detail = fetcher.fetch(url, self.code, force_browser=False, login_expected=False)
+        try:
+            detail = fetcher.fetch(
+                url, self.code, force_browser=False, login_expected=False, browser_fallback=False
+            )
+        except Exception as exc:
+            logger.warning("AMM detail failed url=%s phase=detail error=%s", url, exc)
+            raise
         candidate = self.parse(detail.html, detail.url)
         room_id = _amm_detail_id(detail.url)
         if not room_id:
             return candidate
         gallery_url = f"https://www.otoku-chintai.com/bkn/ajax/library/?{urlencode({'roomId': room_id})}"
         try:
-            gallery = fetcher.fetch(gallery_url, self.code, force_browser=False, login_expected=False)
+            gallery = fetcher.fetch(
+                gallery_url, self.code, force_browser=False, login_expected=False, browser_fallback=False
+            )
             parsed = urlsplit(gallery.url)
             if parsed.scheme.lower() == "https" and (parsed.hostname or "").lower() == "www.otoku-chintai.com":
                 candidate.photo_sources = _photo_sources(gallery.html, room_id)
             else:
                 candidate.scrape_warnings.append("AMM 사진 gallery 최종 host 확인 실패")
         except Exception as exc:
+            logger.warning("AMM gallery failed url=%s phase=gallery error=%s", gallery_url, exc)
             candidate.scrape_warnings.append(f"AMM 사진 gallery 수집 실패: {exc}")
         return candidate
 
