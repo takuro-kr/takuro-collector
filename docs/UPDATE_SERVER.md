@@ -38,3 +38,33 @@ BUILD_EXE.bat
 ```
 
 서버에는 `release-output/latest.json`과 `release-output/releases/0.4.8/TAKURO-Collector-0.4.8.zip`만 업로드합니다.
+
+## Release Publisher
+
+Publisher는 `www1139.onamae.ne.jp:21`에 explicit FTPS로 접속하며 Windows
+Credential Manager에 저장된 전용 계정만 사용합니다. PowerShell에서 최초 1회
+아래 명령을 실행하면 비밀번호를 대화형으로 입력할 수 있습니다. 명령줄이나
+저장소에 비밀번호를 직접 적지 마세요.
+
+```powershell
+cmdkey /generic:"TAKURO Collector Release Publisher" `
+  /user:"takuro@updates.takuro.tech" /pass
+```
+
+게시 전 읽기 전용 계획 확인:
+
+```powershell
+.\.venv\Scripts\python.exe tools\publish_release.py --dry-run
+```
+
+실제 게시:
+
+```powershell
+.\.venv\Scripts\python.exe tools\publish_release.py
+```
+
+Publisher는 로컬 manifest 서명과 ZIP SHA-256/package version을 먼저 검증합니다.
+ZIP은 `.uploading`으로 올려 재다운로드 검증 후 rename하고, manifest는 임시
+파일 검증 후 `latest.json`을 백업·교체합니다. HTTPS 비캐시/일반 URL 검증이
+모두 끝난 후에만 `/releases`의 엄격한 semantic-version 폴더 중 최신 3개를
+제외한 구버전을 정리합니다.
