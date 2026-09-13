@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -83,17 +84,71 @@ def _original_image(raw_url: str) -> str:
     parsed = urlsplit(raw_url)
     if parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != "image.reblo.net":
         return ""
-    path = unquote(parse_qs(parsed.query).get("f", [""])[0]) if parsed.path == "/img_thumb.php" else parsed.path
+    query = parse_qs(parsed.query)
+    if parsed.path == "/img_thumb.php":
+        path = unquote(query.get("f", [""])[0])
+    elif parsed.path == "/img_thumbnail.php":
+        directory = unquote(query.get("dir", [""])[0])
+        filename = unquote(query.get("nm", [""])[0])
+        path = f"{directory.rstrip('/')}/{filename}" if directory and filename else ""
+    else:
+        path = parsed.path
     path = path.removeprefix("./").lstrip("/")
     if not path.startswith("cl_img/") or ".." in path.split("/"):
         return ""
     return f"https://image.reblo.net/{path}"
 
 
+def _facility_photo_urls(soup: BeautifulSoup) -> list[str]:
+    """Return only images categorized by SKY's explicit nearby-facilities DOM."""
+    result: list[str] = []
+    for image in soup.select("#facilities .facilities-photo img"):
+        url = _original_image(str(image.get("data-src") or image.get("src") or "").strip())
+        if url and "/cl_img/build_facility_img_" in url and url not in result:
+            result.append(url)
+    return result
+
+
+def _exclude_facility_copies(soup: BeautifulSoup, photos: list[dict], download) -> list[dict]:
+    """Remove gallery aliases that are byte-identical to explicit facility images.
+
+    SKY sometimes copies a #facilities image into room_other_img with the generic
+    caption その他画像.  The two URLs have no shared ID, so exact source-byte identity
+    is the only page-backed relation. Failed/ambiguous comparisons retain the photo.
+    """
+    facility_hashes: set[str] = set()
+    for url in _facility_photo_urls(soup):
+        try:
+            facility_hashes.add(hashlib.sha256(download(url)).hexdigest())
+        except Exception:
+            continue
+    if not facility_hashes:
+        return photos
+    result: list[dict] = []
+    for photo in photos:
+        if photo.get("alt") != "その他画像":
+            result.append(photo)
+            continue
+        try:
+            digest = hashlib.sha256(download(str(photo["url"]))).hexdigest()
+        except Exception:
+            result.append(photo)
+            continue
+        if digest not in facility_hashes:
+            result.append(photo)
+    return result
+
+
 def _photo_sources(soup: BeautifulSoup, building_id: str, room_id: str) -> list[dict]:
     result: list[dict] = []
     seen: set[str] = set()
-    for image in soup.select("#photo-gallery img"):
+    # #facilities uses the separate build_facility_img_* family and must never
+    # be treated as listing photography. The room plan is rendered separately
+    # from the gallery in the live detail template.
+    images = [*soup.select("#photo-gallery img"), *soup.select("section#room-detail #room-layout-photo img")]
+    for image in images:
+        if image.find_parent(id="facilities"):
+            continue
         url = _original_image(str(image.get("data-src") or image.get("src") or "").strip())
         if not url or url in seen:
             continue
@@ -245,7 +300,16 @@ class SKYAdapter(BaseAdapter):
             if re.fullmatch(rf"/build-{re.escape(requested[0])}/?", parsed.path):
                 raise ListingInactive("SKY 모집 종료 후 건물 페이지 이동")
             raise ValueError("SKY 상세 최종 URL 확인 실패")
-        return self.parse(detail.html, detail.url)
+        candidate = self.parse(detail.html, detail.url)
+        soup = BeautifulSoup(detail.html, "html.parser")
+        candidate.photo_sources = _exclude_facility_copies(
+            soup,
+            candidate.photo_sources,
+            lambda photo_url: fetcher.download(
+                photo_url, self.code, referer=detail.url, cookies=detail.cookies,
+            )[0],
+        )
+        return candidate
 
     def parse(self, html: str, url: str) -> PropertyCandidate:
         identity = _identity(url)

@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from bs4 import BeautifulSoup
 
 import takuro_collector.collector as collector_module
 from takuro_collector.collector import CollectorEngine
@@ -9,7 +10,7 @@ from takuro_collector.db import Database
 from takuro_collector.fetcher import FetchResult
 from takuro_collector.models import PropertyCandidate
 from takuro_collector.sites.base import DiscoveryResult, ListingInactive
-from takuro_collector.sites.sky import SKYAdapter, _original_image
+from takuro_collector.sites.sky import SKYAdapter, _exclude_facility_copies, _original_image
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -83,20 +84,62 @@ def test_multiple_transport_preserves_order_and_raw_text():
 
 def test_gallery_uses_originals_scope_and_order_without_duplicates_or_surroundings():
     photos = SKYAdapter().parse(fixture("sky_detail_25662706.html"), DETAIL_URL).photo_sources
-    assert [photo["kind"] for photo in photos] == ["interior", "floorplan", "exterior", "common_area"]
+    assert [photo["kind"] for photo in photos] == ["interior", "exterior", "common_area", "floorplan"]
     assert [photo["url"] for photo in photos] == [
         "https://image.reblo.net/cl_img/room_other_img_1/room_4397_25662706_1.jpg",
-        "https://image.reblo.net/cl_img/room_layout_img/layout_4397_25662706.jpg",
         "https://image.reblo.net/cl_img/build_photo_img/build_4397_6700506.jpg",
         "https://image.reblo.net/cl_img/build_other_img_1/build_4397_6700506_1.jpg",
+        "https://image.reblo.net/cl_img/room_layout_img/layout_4397_25662706.jpg",
     ]
     assert all("img_thumb.php" not in photo["url"] for photo in photos)
 
 
+def test_surrounding_facilities_dom_is_excluded_without_brand_rules():
+    photos = SKYAdapter().parse(fixture("sky_detail_25662706.html"), DETAIL_URL).photo_sources
+    assert all("build_facility_img" not in photo["url"] for photo in photos)
+    assert all("近隣スーパー" not in photo["alt"] for photo in photos)
+    assert {photo["kind"] for photo in photos} >= {"interior", "exterior", "common_area"}
+
+
+def test_separate_room_layout_is_collected_as_original_floorplan():
+    photos = SKYAdapter().parse(fixture("sky_detail_25662706.html"), DETAIL_URL).photo_sources
+    plans = [photo for photo in photos if photo["kind"] == "floorplan"]
+    assert plans == [{"url": "https://image.reblo.net/cl_img/room_layout_img/layout_4397_25662706.jpg",
+                      "alt": "間取", "kind": "floorplan"}]
+
+
 def test_original_conversion_rejects_other_hosts_and_path_traversal():
     assert _original_image("https://image.reblo.net/img_thumb.php?x=1&f=./cl_img/a.jpg") == "https://image.reblo.net/cl_img/a.jpg"
+    assert _original_image("https://image.reblo.net/img_thumbnail.php?w=240&dir=./cl_img/build_facility_img_1/&nm=facility.jpg") == "https://image.reblo.net/cl_img/build_facility_img_1/facility.jpg"
     assert not _original_image("https://evil.example/img_thumb.php?f=./cl_img/a.jpg")
     assert not _original_image("https://image.reblo.net/img_thumb.php?f=../secret")
+
+
+def test_generic_gallery_copy_of_facility_is_excluded_by_exact_content_not_brand():
+    html = fixture("sky_detail_25662706.html").replace(
+        "</div>\n<section id=\"facilities\"",
+        '<img alt="その他画像" data-src="https://image.reblo.net/img_thumb.php?x=640&amp;y=640&amp;f=./cl_img/room_other_img_2/room_4397_25662706_2.jpg"></div>\n<section id="facilities"',
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    photos = SKYAdapter().parse(html, DETAIL_URL).photo_sources
+    content = {
+        "https://image.reblo.net/cl_img/build_facility_img_1/build_facility_4397_6700506_1.jpg": b"same-facility-image",
+        "https://image.reblo.net/cl_img/room_other_img_2/room_4397_25662706_2.jpg": b"same-facility-image",
+    }
+    filtered = _exclude_facility_copies(soup, photos, lambda url: content[url])
+    assert all("room_other_img_2" not in photo["url"] for photo in filtered)
+    assert any(photo["kind"] == "interior" for photo in filtered)
+
+
+def test_ambiguous_generic_photo_is_retained_when_facility_comparison_fails():
+    html = fixture("sky_detail_25662706.html").replace(
+        "</div>\n<section id=\"facilities\"",
+        '<img alt="その他画像" data-src="https://image.reblo.net/img_thumb.php?x=640&amp;y=640&amp;f=./cl_img/room_other_img_2/room_4397_25662706_2.jpg"></div>\n<section id="facilities"',
+    )
+    soup = BeautifulSoup(html, "html.parser")
+    photos = SKYAdapter().parse(html, DETAIL_URL).photo_sources
+    filtered = _exclude_facility_copies(soup, photos, lambda _url: (_ for _ in ()).throw(OSError("offline")))
+    assert filtered == photos
 
 
 @pytest.mark.parametrize("status", [404, 410])
