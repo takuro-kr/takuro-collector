@@ -22,6 +22,7 @@ _LAYOUT_IMAGE = re.compile(r"^cl_img/room_layout_img/(?:layout|room)_\d+_(?P<roo
 _BUILD_IMAGE = re.compile(r"^cl_img/build_photo_img/build_\d+_(?P<building_id>\d+)\.(?:jpe?g|png|webp)$", re.I)
 _BUILD_OTHER_IMAGE = re.compile(r"^cl_img/build_other_img_\d+/build_\d+_(?P<building_id>\d+)_\d+\.(?:jpe?g|png|webp)$", re.I)
 _COMMON_WORDS = ("エントランス", "ロビー", "廊下", "メールボックス", "宅配ボックス", "エレベーター", "駐輪場", "共用")
+_LAYOUT = re.compile(r"[0-9]+(?:SLDK|SDK|SK|LDK|DK|K|R)", re.I)
 
 
 def _identity(url: str) -> tuple[str, str] | None:
@@ -51,6 +52,24 @@ def _pairs(root) -> dict[str, str]:
 
 def _parts(value: str) -> list[str]:
     return [clean_text(item) for item in re.split(r"[/／]", value or "")]
+
+
+def _heading_identity(heading_text: str, floor_text: str) -> tuple[str, str]:
+    """Read SKY's displayed property/unit label without deriving it from URL IDs."""
+    text = clean_text(unicodedata.normalize("NFKC", heading_text or ""))
+    if not text:
+        return "", ""
+    separated = re.fullmatch(r"(.+?)\s*[｜|]\s*(.+?)\s*", text)
+    if separated:
+        return clean_text(separated.group(1)), normalize_room(separated.group(2))
+    numbered = re.fullmatch(r"(.+?)\s+([0-9A-Z-]+)\s*号室\s*", text, re.I)
+    if numbered:
+        return clean_text(numbered.group(1)), normalize_room(numbered.group(2))
+    # Some live SKY listings intentionally omit a room number and disclose only
+    # the occupied floor. Preserve that exact displayed locator instead of
+    # inventing a room number from the URL or borrowing another room card.
+    displayed_floor = _parts(floor_text)[0] if floor_text else ""
+    return text, displayed_floor
 
 
 def _transport(root) -> list[dict]:
@@ -204,7 +223,7 @@ class SKYAdapter(BaseAdapter):
             if fee:
                 facts["management_fee"] = parse_yen(fee.get_text(" ", strip=True))
             if layout:
-                match = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", clean_text(layout.get_text(" ", strip=True)), re.I)
+                match = _LAYOUT.search(clean_text(layout.get_text(" ", strip=True)))
                 if match:
                     facts["layout"] = match.group(0).upper()
             parsed_area = parse_area(area.get_text(" ", strip=True)) if area else None
@@ -269,7 +288,7 @@ class SKYAdapter(BaseAdapter):
                 if old is None or abs(float(old) - float(new)) > 0.001:
                     return "changed"
             elif key == "layout":
-                match = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", str(old or ""), re.I)
+                match = _LAYOUT.search(str(old or ""))
                 if not match or match.group(0).upper() != str(new).upper():
                     return "changed"
             elif int(old or 0) != int(new or 0):
@@ -324,9 +343,6 @@ class SKYAdapter(BaseAdapter):
 
         heading = soup.select_one("#room-page-buildName-number")
         heading_text = clean_text(heading.get_text(" ", strip=True) if heading else "")
-        heading_match = re.match(r"(.+?)(?:\s*[｜|]\s*|\s+)([0-9０-９]+)\s*号室\s*$", heading_text)
-        building_name = clean_text(heading_match.group(1)) if heading_match else ""
-        room = normalize_room(heading_match.group(2)) if heading_match else ""
         rent_fee = _parts(room_pairs.get("賃料/管理費", ""))
         layout_area = _parts(room_pairs.get("間取り/専有面積", ""))
         # The live detail template places these two headline values above
@@ -340,9 +356,11 @@ class SKYAdapter(BaseAdapter):
             layout, area_node = soup.select_one(".layout"), soup.select_one(".exc_area")
             layout_text = clean_text(layout.get_text(" ", strip=True)) if layout else ""
             area_text = clean_text(area_node.get_text(" ", strip=True)) if area_node else ""
-            layout_match = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", layout_text, re.I)
-            layout_area = [layout_match.group(0) if layout_match else "", area_text]
+            layout_match = _LAYOUT.search(layout_text)
+            explicit_unknown = "-" if unicodedata.normalize("NFKC", layout_text).strip().startswith("-") else ""
+            layout_area = [layout_match.group(0) if layout_match else explicit_unknown, area_text]
         terms, floors = _parts(room_pairs.get("敷金/礼金", "")), _parts(room_pairs.get("階数", ""))
+        building_name, room = _heading_identity(heading_text, room_pairs.get("階数", ""))
         address = room_pairs.get("住所", "")
         equipment: list[str] = []
         for node in soup.select("#equipments .equipments-list-item-content"):

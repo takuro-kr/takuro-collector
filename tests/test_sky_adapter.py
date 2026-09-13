@@ -75,6 +75,26 @@ def test_detail_fields_money_area_floor_date_equipment_and_management():
     assert "浴室乾燥機" in item.equipment and "宅配ボックス" in item.equipment
 
 
+@pytest.mark.parametrize(("heading", "floor", "layout", "expected_name", "expected_room"), [
+    ("KYビル｜1B号室", "1階", "1K", "KYビル", "1B"),
+    ("スカイコート生田｜B103号室", "-1階", "1R", "スカイコート生田", "B103"),
+    ("世田谷区喜多見8丁目の賃貸マンション", "2階", "1K", "世田谷区喜多見8丁目の賃貸マンション", "2階"),
+    ("スカイルーチェ浦和テナント｜2", "1階", "-", "スカイルーチェ浦和テナント", "2"),
+])
+def test_detail_heading_variants_use_only_current_displayed_dom(
+        heading, floor, layout, expected_name, expected_room):
+    html = fixture("sky_detail_heading_variants.html").format(heading=heading, floor=floor, layout=layout)
+    item = SKYAdapter().parse(html, DETAIL_URL)
+    assert (item.building_name, item.room) == (expected_name, expected_room)
+    assert item.layout == layout
+
+
+def test_sky_layout_accepts_observed_one_sk_notation():
+    html = fixture("sky_detail_heading_variants.html").format(
+        heading="防音マンション スカイラシクラス田園調布本町｜303号室", floor="3階", layout="1SK")
+    assert SKYAdapter().parse(html, DETAIL_URL).layout == "1SK"
+
+
 def test_multiple_transport_preserves_order_and_raw_text():
     routes = SKYAdapter().parse(fixture("sky_detail_25662706.html"), DETAIL_URL).transport
     assert [(x["line"], x["station"], x["walk_minutes"]) for x in routes] == [
