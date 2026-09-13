@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
@@ -18,6 +19,7 @@ class KinoshitaAdapter(BaseAdapter):
     label = "木下の賃貸"
     domains = ("kinoshita-chintai.com",)
     management_company = "株式会社木下の賃貸"
+    detail_refresh_ttl = timedelta(days=30)
     seed_urls = ("https://kinoshita-chintai.com/",)
     detail_patterns = (r"/details/([^/?#]+?)details\.html(?:$|[?#])",)
 
@@ -133,14 +135,35 @@ class KinoshitaAdapter(BaseAdapter):
                 room = normalize_room(cells[2] if len(cells) >= 3 else "")
                 rent = parse_yen(cells[3]) if len(cells) >= 4 else 0
                 mgmt = 0
+                mgmt_known = False
                 if len(cells) >= 4:
                     rm = re.search(r"[（(]\s*([0-9０-９,，]+)\s*円?\s*[）)]", cls._nfkc(cells[3]))
                     if rm:
                         mgmt = parse_yen(rm.group(1))
+                        mgmt_known = True
+                layout = ""
+                area = None
+                if len(cells) >= 6:
+                    layout_area = cls._nfkc(cells[5])
+                    layout_match = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", layout_area, re.I)
+                    area_match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(?:m2|m²|㎡)", layout_area, re.I)
+                    if layout_match:
+                        layout = layout_match.group(0).upper()
+                    if area_match:
+                        area = float(area_match.group(1))
                 source_id, _ = cls().source_id(detail_url)
                 if not building or not room:
                     continue
                 seen.add(detail_url)
+                change_facts = {}
+                if rent:
+                    change_facts["rent"] = rent
+                if mgmt_known:
+                    change_facts["management_fee"] = mgmt
+                if layout:
+                    change_facts["layout"] = layout
+                if area is not None:
+                    change_facts["area"] = area
                 out.append({
                     "url": detail_url,
                     "source_site": canonical_host(detail_url),
@@ -152,6 +175,9 @@ class KinoshitaAdapter(BaseAdapter):
                     "prefecture": pref,
                     "rent": rent,
                     "management_fee": mgmt,
+                    "layout": layout,
+                    "area": area,
+                    "change_facts": change_facts,
                 })
         return total, out
 
@@ -243,7 +269,33 @@ class KinoshitaAdapter(BaseAdapter):
             messages=messages,
             inventory_complete=inventory_complete,
             inventory_site=canonical_host(self.SEARCH_URL),
+            inventory_items=hints,
         )
+
+    def existing_inventory_action(self, existing: dict, item: dict, *, now: datetime | None = None) -> str:
+        """Choose detail refresh using only facts explicitly present in KIN list rows."""
+        facts = dict(item.get("change_facts") or {})
+        for key in ("rent", "management_fee", "layout", "area"):
+            if key not in facts:
+                continue
+            old, new = existing.get(key), facts[key]
+            if key == "area":
+                if old is None or abs(float(old) - float(new)) > 0.001:
+                    return "changed"
+            elif key == "layout":
+                old_layout = re.search(r"[0-9]+(?:SLDK|LDK|DK|K|R)", str(old or ""), re.I)
+                if not old_layout or old_layout.group(0).upper() != str(new).upper():
+                    return "changed"
+            elif int(old or 0) != int(new):
+                return "changed"
+        try:
+            refreshed = datetime.fromisoformat(str(existing.get("last_seen_at") or ""))
+            if refreshed.tzinfo is None:
+                refreshed = refreshed.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            return "ttl"
+        current = now or datetime.now(timezone.utc).astimezone()
+        return "ttl" if current - refreshed >= self.detail_refresh_ttl else "unchanged"
 
     @classmethod
     def _combined_rent_fee(cls, pairs, body_text: str = "") -> tuple[int, int]:
