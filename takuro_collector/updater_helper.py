@@ -65,7 +65,8 @@ def install(command: dict, *, launch=subprocess.Popen, timeout: float = 30, wait
     install_dir, staged_dir = Path(command["install_dir"]).resolve(), Path(command["staged_dir"]).resolve()
     user_root, marker = Path(command["data_root"]).resolve(), Path(command["marker"]).resolve()
     executable = str(command["executable"])
-    update_root, backup = user_root / "updates", user_root / "updates" / "backup" / "known-good"
+    update_root = user_root / "updates"
+    backup = install_dir.parent / f".{install_dir.name}.known-good"
     prepared = install_dir.parent / f".{install_dir.name}.update-new"
     if install_dir == user_root or user_root in install_dir.parents or install_dir in user_root.parents:
         raise RuntimeError("프로그램 폴더와 사용자 데이터 폴더가 안전하게 분리되지 않았습니다.")

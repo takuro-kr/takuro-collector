@@ -9,6 +9,7 @@ import pytest
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from takuro_collector import updater, updater_helper
@@ -163,8 +164,9 @@ class Process:
     def terminate(self): pass
 
 
-def install_fixture(tmp_path):
-    install, staged, user = tmp_path / "program" / "TAKURO Collector", tmp_path / "stage", tmp_path / "user"
+def install_fixture(tmp_path, *, install_parent=None):
+    install = (install_parent or (tmp_path / "program")) / "TAKURO Collector"
+    staged, user = tmp_path / "stage", tmp_path / "user"
     for root, value in ((install, b"old"), (staged, b"new")):
         (root / "_internal").mkdir(parents=True); (root / "TAKURO Collector.exe").write_bytes(value)
     user.mkdir(); (user / "collector.db").write_bytes(b"database"); (user / "settings.txt").write_text("secret")
@@ -180,7 +182,29 @@ def test_helper_replaces_program_and_preserves_user_data(tmp_path):
     assert (install / "TAKURO Collector.exe").read_bytes() == b"new"
     assert (user / "collector.db").read_bytes() == b"database"
     assert (user / "settings.txt").read_text() == "secret"
-    assert (user / "updates" / "backup" / "known-good" / "TAKURO Collector.exe").read_bytes() == b"old"
+    assert (install.parent / ".TAKURO Collector.known-good" / "TAKURO Collector.exe").read_bytes() == b"old"
+
+
+def test_helper_replaces_stale_same_volume_backup(tmp_path):
+    command, install, _user, marker = install_fixture(tmp_path)
+    backup = install.parent / ".TAKURO Collector.known-good"
+    backup.mkdir()
+    (backup / "stale.txt").write_text("stale", encoding="utf-8")
+    assert updater_helper.install(command, launch=lambda *_a, **_k: Process(marker, command["token"]),
+                                  timeout=.2, wait_exit=lambda *_: True) == "launch_verified"
+    assert not (backup / "stale.txt").exists()
+    assert (backup / "TAKURO Collector.exe").read_bytes() == b"old"
+
+
+@pytest.mark.skipif(os.name != "nt" or not Path("D:/").is_dir(), reason="Windows D: cross-volume regression")
+def test_helper_cross_volume_user_data_and_portable_install(tmp_path):
+    with tempfile.TemporaryDirectory(prefix="takuro updater D space ", dir="D:/") as directory:
+        command, install, user, marker = install_fixture(tmp_path, install_parent=Path(directory) / "portable path")
+        assert updater_helper.install(command, launch=lambda *_a, **_k: Process(marker, command["token"]),
+                                      timeout=.2, wait_exit=lambda *_: True) == "launch_verified"
+        assert (install / "TAKURO Collector.exe").read_bytes() == b"new"
+        assert (install.parent / ".TAKURO Collector.known-good" / "TAKURO Collector.exe").read_bytes() == b"old"
+        assert (user / "collector.db").read_bytes() == b"database"
 
 
 def test_helper_rolls_back_when_new_version_does_not_start(tmp_path):
