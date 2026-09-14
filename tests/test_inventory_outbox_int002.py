@@ -419,7 +419,7 @@ def test_local_registration_endpoint_delivery_e2e(tmp_path, monkeypatch):
     db.close()
 
 
-def test_default_rollout_routes_outbox_to_legacy_connect_only(tmp_path, monkeypatch):
+def test_default_cutover_routes_outbox_to_registration_only(tmp_path, monkeypatch):
     db = Database(tmp_path / "db.sqlite3")
     run = db.save_inventory_snapshot("KIN", "kin.example", [item("one")])
     calls = {"legacy": [], "registration": []}
@@ -431,19 +431,19 @@ def test_default_rollout_routes_outbox_to_legacy_connect_only(tmp_path, monkeypa
 
         def send_inventory_run(self, **kwargs):
             calls["registration"].append(kwargs)
-            raise AssertionError("default rollout must not call Registration inventory")
+            return accepted(kwargs)
 
-    assert INVENTORY_DELIVERY_MODE == "legacy_connect"
+    assert INVENTORY_DELIVERY_MODE == "registration_v2"
     sync = WordPressSync(db)
     monkeypatch.setattr(sync, "client", lambda: Client())
     result = sync.sync_inventory_snapshots()
-    assert len(calls["legacy"]) == 1
-    assert calls["registration"] == []
-    assert set(calls["legacy"][0]) == {
-        "source_site", "source_property_ids", "complete", "errors", "parse_errors", "blockers"
+    assert len(calls["registration"]) == 1
+    assert calls["legacy"] == []
+    assert set(calls["registration"][0]) == {
+        "source_site", "source_property_ids", "run_id", "completed_at"
     }
     assert result["synced_snapshots"] == 1
-    assert result["results"][0]["destination"] == "legacy_connect"
+    assert result["results"][0]["duplicate_run"] is False
     assert db.inventory_outbox_rows()[0]["run_id"] == run["run_id"]
     assert db.inventory_outbox_rows()[0]["delivery_status"] == "accepted"
     db.close()
@@ -463,7 +463,7 @@ def test_legacy_connect_requires_boolean_true_and_keeps_retryable(tmp_path, monk
         def send_inventory_run(self, **kwargs):
             raise AssertionError("dual-write")
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode="legacy_connect")
     monkeypatch.setattr(sync, "client", lambda: Client())
     result = sync.sync_inventory_snapshots()
     row = db.inventory_outbox_rows()[0]

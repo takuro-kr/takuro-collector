@@ -19,9 +19,9 @@ from .utils import canonical_host
 
 logger = get_logger("wordpress")
 
-# INT-002 staged rollout: durable outbox is active, but lifecycle authority
-# remains on the legacy Connect endpoint until a separate architecture approval.
-INVENTORY_DELIVERY_MODE = "legacy_connect"
+# INT-002 cutover: Registration V2 is the authoritative inventory destination.
+# Legacy Connect support remains available for explicit rollback only.
+INVENTORY_DELIVERY_MODE = "registration_v2"
 INVENTORY_DELIVERY_MODES = {"legacy_connect", "registration_v2"}
 
 

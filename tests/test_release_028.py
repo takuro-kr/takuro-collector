@@ -193,7 +193,7 @@ def test_inventory_sync_sends_382_ids_once_and_marks_snapshot_synced(tmp_path, m
                 'accepted': True, 'transport': 'rest_json',
             }
 
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode='legacy_connect')
     monkeypatch.setattr(sync, 'client', lambda: Client())
     progress = []
     out = sync.sync_inventory_snapshots(progress_callback=lambda d, t, m: progress.append((d, t, m)))
@@ -220,7 +220,7 @@ def test_inventory_sync_does_not_send_malformed_local_snapshot(tmp_path, monkeyp
     class Client:
         def send_inventory_snapshot(self, **kwargs):
             raise AssertionError('malformed snapshot must not be sent')
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode='legacy_connect')
     monkeypatch.setattr(sync, 'client', lambda: Client())
     out = sync.sync_inventory_snapshots()
     assert out['synced_snapshots'] == 0
@@ -236,7 +236,7 @@ def test_inventory_sync_http_error_keeps_snapshot_unsynced(tmp_path, monkeypatch
     class Client:
         def send_inventory_snapshot(self, **kwargs):
             raise WordPressError('HTTP 503: upstream unavailable')
-    sync = WordPressSync(db)
+    sync = WordPressSync(db, inventory_delivery_mode='legacy_connect')
     monkeypatch.setattr(sync, 'client', lambda: Client())
     out = sync.sync_inventory_snapshots()
     assert out['synced_snapshots'] == 0
